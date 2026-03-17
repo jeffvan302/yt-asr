@@ -83,6 +83,7 @@ class EditableSegment:
     original_start_s: float
     original_end_s: float
     enabled: bool = True
+    reviewed: bool = False
 
 
 @dataclass
@@ -270,6 +271,7 @@ def segment_from_payload(payload: dict[str, Any]) -> EditableSegment:
         original_start_s=float(payload.get("original_start_s", payload["start_s"])),
         original_end_s=float(payload.get("original_end_s", payload["end_s"])),
         enabled=bool(payload.get("enabled", True)),
+        reviewed=bool(payload.get("reviewed", False)),
     )
 
 
@@ -863,7 +865,8 @@ class ASRReviewApp:
         self.segment_label_var = tk.StringVar(value="No phrase selected.")
         self.start_var = tk.StringVar()
         self.end_var = tk.StringVar()
-        self.enabled_var = tk.BooleanVar(value=True)
+        self.enabled_var  = tk.BooleanVar(value=True)
+        self.reviewed_var = tk.BooleanVar(value=False)
 
         self.root.title("YouTube ASR Review")
         self.root.geometry("1680x960")
@@ -1121,7 +1124,13 @@ class ASRReviewApp:
             text="Include in export",
             variable=self.enabled_var,
             command=self._toggle_current_segment_enabled,
-        ).grid(row=1, column=10, sticky="w")
+        ).grid(row=1, column=10, sticky="w", padx=(0, 10))
+        ttk.Checkbutton(
+            controls,
+            text="Reviewed",
+            variable=self.reviewed_var,
+            command=self._toggle_current_segment_reviewed,
+        ).grid(row=1, column=11, sticky="w")
 
         ttk.Button(controls, text="Split at Cursor", command=self._split_at_cursor).grid(
             row=2, column=0, columnspan=2, padx=(0, 6), pady=(8, 0), sticky="w"
@@ -1145,7 +1154,7 @@ class ASRReviewApp:
         )
         self.segment_tree = ttk.Treeview(
             segments_frame,
-            columns=("start", "end", "enabled"),
+            columns=("start", "end", "enabled", "reviewed"),
             show="tree headings",
             selectmode="extended",
         )
@@ -1153,13 +1162,20 @@ class ASRReviewApp:
         self.segment_tree.heading("start", text="Start")
         self.segment_tree.heading("end", text="End")
         self.segment_tree.heading("enabled", text="Use")
-        self.segment_tree.column("#0", width=360, stretch=True)
+        self.segment_tree.heading("reviewed", text="Reviewed")
+        self.segment_tree.column("#0", width=320, stretch=True)
         self.segment_tree.column("start", width=72, stretch=False, anchor="e")
         self.segment_tree.column("end", width=72, stretch=False, anchor="e")
         self.segment_tree.column("enabled", width=50, stretch=False, anchor="center")
-        self.segment_tree.tag_configure("disabled", foreground="#6b7280")
+        self.segment_tree.column("reviewed", width=70, stretch=False, anchor="center")
+        # Row colour tags — four combinations of enabled/reviewed state
+        self.segment_tree.tag_configure("normal",            foreground="#111827", background="#ffffff")
+        self.segment_tree.tag_configure("reviewed",          foreground="#111827", background="#d1fae5")
+        self.segment_tree.tag_configure("disabled",          foreground="#9ca3af", background="#ffffff")
+        self.segment_tree.tag_configure("disabled_reviewed", foreground="#9ca3af", background="#d1fae5")
         self.segment_tree.grid(row=1, column=0, sticky="nsew")
         self.segment_tree.bind("<<TreeviewSelect>>", self._on_segment_selected)
+        self.segment_tree.bind("<ButtonRelease-1>", self._on_segment_tree_click)
         seg_scroll = ttk.Scrollbar(
             segments_frame, orient="vertical", command=self.segment_tree.yview
         )
@@ -1391,6 +1407,16 @@ class ASRReviewApp:
             self._redraw_waveform()
         self._set_status(f"Loaded {project.title}")
 
+    def _segment_row_tag(self, segment: "EditableSegment") -> str:
+        """Return the single treeview tag that encodes both enabled and reviewed state."""
+        if segment.enabled and segment.reviewed:
+            return "reviewed"
+        if not segment.enabled and segment.reviewed:
+            return "disabled_reviewed"
+        if not segment.enabled:
+            return "disabled"
+        return "normal"
+
     def _populate_segment_tree(self) -> None:
         for item in self.segment_tree.get_children():
             self.segment_tree.delete(item)
@@ -1399,7 +1425,6 @@ class ASRReviewApp:
             return
 
         for index, segment in enumerate(self.current_project.segments):
-            tags = ("disabled",) if not segment.enabled else ()
             self.segment_tree.insert(
                 "",
                 "end",
@@ -1408,9 +1433,10 @@ class ASRReviewApp:
                 values=(
                     self._format_s(segment.start_s),
                     self._format_s(segment.end_s),
-                    "Yes" if segment.enabled else "No",
+                    "✓" if segment.enabled  else "✗",
+                    "✓" if segment.reviewed else "☐",
                 ),
-                tags=tags,
+                tags=(self._segment_row_tag(segment),),
             )
 
     def _unsuspend_segment_select(self) -> None:
@@ -1437,6 +1463,38 @@ class ASRReviewApp:
         if first != self.current_segment_index:
             self._select_segment_by_index(first)
 
+    def _on_segment_tree_click(self, event: tk.Event[Any]) -> None:
+        """Toggle the Reviewed flag when the Reviewed column cell is clicked."""
+        col = self.segment_tree.identify_column(event.x)   # e.g. "#4"
+        row = self.segment_tree.identify_row(event.y)       # iid string, or ""
+        if not row or col != "#4":   # #4 = 4th data column = "reviewed"
+            return
+        if not self.current_project:
+            return
+        index = int(row)
+        if index < 0 or index >= len(self.current_project.segments):
+            return
+        segment = self.current_project.segments[index]
+        segment.reviewed = not segment.reviewed
+        # Sync the checkbox widget if this is also the currently selected segment
+        if index == self.current_segment_index:
+            self.reviewed_var.set(segment.reviewed)
+        # Refresh just this row and persist
+        item_id = str(index)
+        if self.segment_tree.exists(item_id):
+            values = self.segment_tree.item(item_id, "values")
+            self.segment_tree.item(
+                item_id,
+                values=(
+                    values[0],
+                    values[1],
+                    values[2],
+                    "✓" if segment.reviewed else "☐",
+                ),
+                tags=(self._segment_row_tag(segment),),
+            )
+        self._save_current_project()
+
     def _select_segment_by_index(self, index: int) -> None:
         self._select_segment_by_index_no_sync(index)
         self._sync_segment_selection()
@@ -1458,6 +1516,7 @@ class ASRReviewApp:
         self.start_var.set(f"{segment.start_s:.3f}")
         self.end_var.set(f"{segment.end_s:.3f}")
         self.enabled_var.set(segment.enabled)
+        self.reviewed_var.set(segment.reviewed)
         self.segment_label_var.set(
             f"Phrase {index + 1}/{len(self.current_project.segments)}  |  "
             f"{segment.end_s - segment.start_s:.2f}s"
@@ -1530,6 +1589,7 @@ class ASRReviewApp:
             return False
         segment.text = new_text
         self.text_dirty = False
+        self._mark_current_reviewed()
         self._sync_segment_ui()
         return True
 
@@ -1577,6 +1637,7 @@ class ASRReviewApp:
         segment.end_s = end_s
         self.start_var.set(f"{segment.start_s:.3f}")
         self.end_var.set(f"{segment.end_s:.3f}")
+        self._mark_current_reviewed()
         self._save_current_project()
         self._refresh_playback_data()
         self._sync_segment_ui()
@@ -1607,6 +1668,26 @@ class ASRReviewApp:
         self._save_current_project()
         self._sync_segment_ui()
 
+    def _toggle_current_segment_reviewed(self) -> None:
+        """Manual toggle of the Reviewed checkbox."""
+        if not self.current_project or self.current_segment_index is None:
+            return
+        segment = self.current_project.segments[self.current_segment_index]
+        segment.reviewed = self.reviewed_var.get()
+        self._save_current_project()
+        self._sync_segment_ui()
+
+    def _mark_current_reviewed(self) -> None:
+        """Auto-mark the current segment as reviewed (called on play / edit)."""
+        if not self.current_project or self.current_segment_index is None:
+            return
+        segment = self.current_project.segments[self.current_segment_index]
+        if segment.reviewed:
+            return  # already reviewed — nothing to do
+        segment.reviewed = True
+        self.reviewed_var.set(True)
+        self._sync_segment_ui()
+
     def _save_current_project(self, show_feedback: bool = False) -> bool:
         if not self.current_project:
             return False
@@ -1632,16 +1713,16 @@ class ASRReviewApp:
         segment = self.current_project.segments[self.current_segment_index]
         item_id = str(self.current_segment_index)
         if self.segment_tree.exists(item_id):
-            tags = ("disabled",) if not segment.enabled else ()
             self.segment_tree.item(
                 item_id,
                 text=segment.text,
                 values=(
                     self._format_s(segment.start_s),
                     self._format_s(segment.end_s),
-                    "Yes" if segment.enabled else "No",
+                    "✓" if segment.enabled  else "✗",
+                    "✓" if segment.reviewed else "☐",
                 ),
-                tags=tags,
+                tags=(self._segment_row_tag(segment),),
             )
         self.segment_label_var.set(
             f"Phrase {self.current_segment_index + 1}/{len(self.current_project.segments)}  |  "
@@ -1921,6 +2002,7 @@ class ASRReviewApp:
             return
         if not self.current_project or self.current_segment_index is None:
             return
+        self._mark_current_reviewed()
         segment = self.current_project.segments[self.current_segment_index]
         data, rate, channels, sampwidth = result
         self._playback_data = data
@@ -2076,6 +2158,8 @@ class ASRReviewApp:
 
     def _on_waveform_release(self, _event: tk.Event[Any]) -> None:
         if self.drag_target is not None:
+            self._mark_current_reviewed()
+            self._sync_segment_ui()
             self._save_current_project()
             self._refresh_playback_data()
         self.drag_target = None
