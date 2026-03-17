@@ -1,4 +1,4 @@
-# yt-subtitle-extract
+# Youtube Generated Subtitle Extractor for Transcription training
 
 Download YouTube audio + auto-captions, review timing in a GUI editor, and export ASR training datasets.
 
