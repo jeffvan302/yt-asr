@@ -30,9 +30,10 @@ import threading
 import time
 import traceback
 import wave
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -454,6 +455,199 @@ def create_project_from_url(
     return project
 
 
+# ---------------------------------------------------------------------------
+# .asr package support (ZIP archive with .asr extension)
+# ---------------------------------------------------------------------------
+
+ASR_FORMAT_VERSION = 1
+
+
+def list_asr_contents(asr_path: Path) -> list[dict[str, Any]]:
+    """Return the manifest entries from an .asr package without extracting files."""
+    with zipfile.ZipFile(asr_path, "r") as zf:
+        with zf.open("manifest.json") as fh:
+            manifest = json.loads(fh.read().decode("utf-8"))
+    return manifest.get("projects", [])
+
+
+def pack_asr(
+    workspace: Path,
+    projects: list[VideoProject],
+    dest_path: Path,
+    *,
+    status_hook: Callable[[str], None] | None = None,
+) -> int:
+    """
+    Pack *projects* from *workspace* into an .asr ZIP archive at *dest_path*.
+    Returns the number of projects successfully packed.
+
+    Archive layout::
+
+        manifest.json
+        {video_id}/
+            project.json       # segments + intra-package relative paths
+            metadata.json      # video metadata
+            working_audio.wav  # WAV used for review
+            caption.{ext}      # caption file (.json3 or .vtt)
+    """
+    manifest_projects: list[dict[str, Any]] = []
+    packed = 0
+
+    with zipfile.ZipFile(dest_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for project in projects:
+            slug = sanitize_filename(project.video_id)
+            if status_hook:
+                status_hook(f"Packing {project.title}…")
+
+            working_audio = resolve_path(project.working_audio_file, workspace)
+            caption_file  = resolve_path(project.caption_file, workspace)
+
+            if not working_audio.exists():
+                logger.warning("Skipping %s: working audio missing (%s)", project.video_id, working_audio)
+                continue
+
+            # Intra-package names (flat inside the project folder)
+            intra_audio   = "working_audio.wav"
+            intra_caption = f"caption{caption_file.suffix}"
+
+            # Project payload with package-relative paths
+            pkg_project: dict[str, Any] = {
+                "version":          project.version,
+                "video_id":         project.video_id,
+                "title":            project.title,
+                "channel":          project.channel,
+                "webpage_url":      project.webpage_url,
+                "duration":         project.duration,
+                "caption_language": project.caption_language,
+                "caption_file":     intra_caption,
+                "audio_file":       intra_audio,
+                "working_audio_file": intra_audio,
+                "created_at":       project.created_at,
+                "updated_at":       project.updated_at,
+                "segments":         [asdict(seg) for seg in project.segments],
+            }
+
+            # Metadata (load from workspace if available, otherwise synthesise)
+            meta_p = metadata_path(workspace, project.video_id)
+            if meta_p.exists():
+                raw_meta: dict[str, Any] = json.loads(meta_p.read_text(encoding="utf-8"))
+            else:
+                raw_meta = {
+                    "id":               project.video_id,
+                    "title":            project.title,
+                    "channel":          project.channel,
+                    "webpage_url":      project.webpage_url,
+                    "duration":         project.duration,
+                    "caption_language": project.caption_language,
+                }
+            raw_meta["caption_file"] = intra_caption
+            raw_meta["audio_file"]   = intra_audio
+
+            # Write into archive
+            zf.writestr(f"{slug}/project.json",  json.dumps(pkg_project, ensure_ascii=False, indent=2))
+            zf.writestr(f"{slug}/metadata.json", json.dumps(raw_meta,    ensure_ascii=False, indent=2))
+            zf.write(working_audio, f"{slug}/{intra_audio}")
+            if caption_file.exists():
+                zf.write(caption_file, f"{slug}/{intra_caption}")
+
+            manifest_projects.append({
+                "video_id": project.video_id,
+                "title":    project.title,
+                "channel":  project.channel,
+                "folder":   slug,
+            })
+            packed += 1
+
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {"version": ASR_FORMAT_VERSION, "projects": manifest_projects},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+    return packed
+
+
+def unpack_asr(
+    asr_path: Path,
+    workspace: Path,
+    video_ids: list[str],
+    *,
+    status_hook: Callable[[str], None] | None = None,
+) -> list[str]:
+    """
+    Extract the projects listed in *video_ids* from *asr_path* into *workspace*.
+    Returns the list of video IDs that were successfully imported.
+    """
+    dirs = ensure_app_dirs(workspace)
+    imported: list[str] = []
+
+    with zipfile.ZipFile(asr_path, "r") as zf:
+        arc_names = set(zf.namelist())
+
+        with zf.open("manifest.json") as fh:
+            manifest = json.loads(fh.read().decode("utf-8"))
+
+        for entry in manifest.get("projects", []):
+            vid_id = entry["video_id"]
+            if vid_id not in video_ids:
+                continue
+
+            folder = entry["folder"]
+            if status_hook:
+                status_hook(f"Importing {entry.get('title', vid_id)}…")
+
+            # Read project payload from archive
+            pkg_project: dict[str, Any] = json.loads(
+                zf.read(f"{folder}/project.json").decode("utf-8")
+            )
+
+            intra_audio   = pkg_project.get("working_audio_file", "working_audio.wav")
+            intra_caption = pkg_project.get("caption_file", "caption.json3")
+            caption_ext   = Path(intra_caption).suffix  # e.g. ".json3" or ".vtt"
+
+            # Destination paths inside the workspace
+            slug         = sanitize_filename(vid_id)
+            dest_audio   = dirs["working_audio"] / f"{slug}.wav"
+            dest_caption = dirs["captions"] / f"{slug}{caption_ext}"
+
+            # Extract audio
+            with zf.open(f"{folder}/{intra_audio}") as src, open(dest_audio, "wb") as dst:
+                dst.write(src.read())
+
+            # Extract caption (may be absent in very old packages)
+            caption_arc = f"{folder}/{intra_caption}"
+            if caption_arc in arc_names:
+                with zf.open(caption_arc) as src, open(dest_caption, "wb") as dst:
+                    dst.write(src.read())
+
+            # Rewrite paths to workspace-relative values
+            pkg_project["working_audio_file"] = str(dest_audio.relative_to(workspace))
+            pkg_project["audio_file"]         = str(dest_audio.relative_to(workspace))
+            pkg_project["caption_file"]       = str(dest_caption.relative_to(workspace))
+
+            # Write project.json
+            proj_p = project_path(workspace, vid_id)
+            proj_p.parent.mkdir(parents=True, exist_ok=True)
+            proj_p.write_text(json.dumps(pkg_project, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # Write metadata.json (if present)
+            meta_arc = f"{folder}/metadata.json"
+            if meta_arc in arc_names:
+                raw_meta = json.loads(zf.read(meta_arc).decode("utf-8"))
+                raw_meta["caption_file"] = str(dest_caption.relative_to(workspace))
+                raw_meta["audio_file"]   = str(dest_audio.relative_to(workspace))
+                meta_p = metadata_path(workspace, vid_id)
+                meta_p.parent.mkdir(parents=True, exist_ok=True)
+                meta_p.write_text(json.dumps(raw_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            imported.append(vid_id)
+
+    return imported
+
+
 def export_projects(
     root: Path,
     projects: list[VideoProject],
@@ -526,6 +720,99 @@ def export_projects(
         "clip_count": clip_count,
         "project_count": len(projects),
     }
+
+
+# ---------------------------------------------------------------------------
+# Title-selection dialog (shared by pack and import flows)
+# ---------------------------------------------------------------------------
+
+class TitleSelectDialog(tk.Toplevel):
+    """Modal checklist that lets the user pick a subset of projects by title."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        dialog_title: str,
+        summaries: list[dict[str, Any]],
+        *,
+        default_all: bool = True,
+    ) -> None:
+        super().__init__(parent)
+        self.title(dialog_title)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self._vars: list[tuple[tk.BooleanVar, str]] = []
+        self.result: list[str] | None = None  # None → cancelled
+
+        self._build(summaries, default_all)
+        self.update_idletasks()
+
+        # Centre over the parent window
+        w = 480
+        h = min(480, 100 + len(summaries) * 26 + 60)
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"{w}x{h}+{px - w // 2}+{py - h // 2}")
+        self.minsize(320, 160)
+
+        self.wait_window()
+
+    # ------------------------------------------------------------------
+    def _build(self, summaries: list[dict[str, Any]], default_all: bool) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # --- select-all / select-none row ---
+        top = ttk.Frame(self, padding=(8, 8, 8, 4))
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Button(top, text="Select All",  command=lambda: self._set_all(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(top, text="Select None", command=lambda: self._set_all(False)).pack(side="left")
+
+        # --- scrollable checklist ---
+        list_frame = ttk.Frame(self, padding=(8, 0, 8, 4))
+        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(list_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        inner.bind(
+            "<Configure>",
+            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        for summary in summaries:
+            var = tk.BooleanVar(value=default_all)
+            vid_id = summary["video_id"]
+            label  = summary.get("title") or vid_id
+            ttk.Checkbutton(inner, text=label, variable=var).pack(anchor="w", padx=4, pady=2)
+            self._vars.append((var, vid_id))
+
+        # --- OK / Cancel ---
+        btn_row = ttk.Frame(self, padding=(8, 4, 8, 10))
+        btn_row.grid(row=2, column=0)
+        ttk.Button(btn_row, text="OK",     command=self._ok,     width=10).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Cancel", command=self._cancel, width=10).pack(side="left")
+
+    # ------------------------------------------------------------------
+    def _set_all(self, value: bool) -> None:
+        for var, _ in self._vars:
+            var.set(value)
+
+    def _ok(self) -> None:
+        self.result = [vid_id for var, vid_id in self._vars if var.get()]
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
 
 
 class ASRReviewApp:
@@ -639,6 +926,12 @@ class ASRReviewApp:
         ).grid(row=0, column=11, padx=(0, 6), sticky="n")
         ttk.Button(toolbar, text="Export All", command=self._export_all_projects).grid(
             row=0, column=12, sticky="n"
+        )
+        ttk.Button(toolbar, text="Pack .asr", command=self._pack_asr).grid(
+            row=0, column=13, padx=(10, 6), sticky="n"
+        )
+        ttk.Button(toolbar, text="Import .asr", command=self._unpack_asr).grid(
+            row=0, column=14, sticky="n"
         )
 
         status = ttk.Label(
@@ -2067,6 +2360,120 @@ class ASRReviewApp:
             )
 
         self._run_in_worker("Starting export...", worker, on_done)
+
+    # ------------------------------------------------------------------
+    # .asr package — pack (export)
+    # ------------------------------------------------------------------
+
+    def _pack_asr(self) -> None:
+        summaries = discover_videos(self.workspace)
+        if not summaries:
+            messagebox.showinfo("No Videos", "Download at least one video first.")
+            return
+
+        dlg = TitleSelectDialog(
+            self.root,
+            "Pack .asr — Select Titles to Export",
+            summaries,
+            default_all=True,
+        )
+        selected_ids = dlg.result
+        if not selected_ids:
+            return
+
+        dest = filedialog.asksaveasfilename(
+            title="Save .asr package",
+            defaultextension=".asr",
+            filetypes=[("ASR package", "*.asr"), ("All files", "*.*")],
+        )
+        if not dest:
+            return
+
+        self._save_current_project()
+        dest_path    = Path(dest)
+        selected_set = set(selected_ids)
+
+        def worker() -> dict[str, Any]:
+            projects: list[VideoProject] = []
+            for summary in summaries:
+                if summary["video_id"] not in selected_set:
+                    continue
+                self.worker_queue.put(("status", f"Preparing {summary['title']}…"))
+                projects.append(ensure_project_for_video(self.workspace, summary["video_id"]))
+
+            def status_hook(msg: str) -> None:
+                self.worker_queue.put(("status", msg))
+
+            packed = pack_asr(self.workspace, projects, dest_path, status_hook=status_hook)
+            return {"packed": packed, "dest": str(dest_path)}
+
+        def on_done(result: dict[str, Any]) -> None:
+            packed = result["packed"]
+            self._set_status(f"Packed {packed} project(s) → {result['dest']}")
+            messagebox.showinfo(
+                "Pack Complete",
+                f"Packed {packed} project(s) to:\n{result['dest']}",
+            )
+
+        self._run_in_worker("Packing .asr…", worker, on_done)
+
+    # ------------------------------------------------------------------
+    # .asr package — unpack (import)
+    # ------------------------------------------------------------------
+
+    def _unpack_asr(self) -> None:
+        src = filedialog.askopenfilename(
+            title="Open .asr package",
+            filetypes=[("ASR package", "*.asr"), ("All files", "*.*")],
+        )
+        if not src:
+            return
+
+        asr_path = Path(src)
+        try:
+            entries = list_asr_contents(asr_path)
+        except Exception as exc:
+            messagebox.showerror("Invalid Package", f"Could not read package:\n{exc}")
+            return
+
+        if not entries:
+            messagebox.showinfo("Empty Package", "This package contains no projects.")
+            return
+
+        summaries = [
+            {"video_id": e["video_id"], "title": e.get("title") or e["video_id"]}
+            for e in entries
+        ]
+
+        dlg = TitleSelectDialog(
+            self.root,
+            "Import .asr — Select Titles to Import",
+            summaries,
+            default_all=True,
+        )
+        selected_ids = dlg.result
+        if not selected_ids:
+            return
+
+        def worker() -> dict[str, Any]:
+            def status_hook(msg: str) -> None:
+                self.worker_queue.put(("status", msg))
+            imported = unpack_asr(asr_path, self.workspace, selected_ids, status_hook=status_hook)
+            return {"imported": imported}
+
+        def on_done(result: dict[str, Any]) -> None:
+            imported = result["imported"]
+            selected_id = self.current_project.video_id if self.current_project else None
+            self.refresh_video_list(select_video_id=selected_id)
+            self._set_status(f"Imported {len(imported)} project(s) into {self.workspace}")
+            messagebox.showinfo(
+                "Import Complete",
+                f"Imported {len(imported)} project(s) into workspace.",
+            )
+
+        self._run_in_worker("Importing .asr…", worker, on_done)
+
+    # ------------------------------------------------------------------
 
     def _format_s(self, value: float) -> str:
         return f"{value:.2f}"
