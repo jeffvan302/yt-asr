@@ -1,0 +1,10 @@
+# Core dependencies
+yt-dlp
+
+# Optional: audio playback support (Play/Pause/Stop buttons in GUI)
+# Uncomment to enable:
+# sounddevice>=0.4.6
+
+# System dependencies (not pip-installable — install manually):
+#   ffmpeg       https://ffmpeg.org/download.html
+#   tkinter      ships with most Python installs; on Linux: sudo apt install python3-tk
