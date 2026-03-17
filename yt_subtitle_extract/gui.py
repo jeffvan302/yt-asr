@@ -882,76 +882,108 @@ class ASRReviewApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        toolbar = ttk.Frame(self.root, padding=(10, 10, 10, 6))
+        # ── Toolbar ──────────────────────────────────────────────────────────
+        # Two logical rows inside a single outer frame, separated by thin
+        # vertical separators between functional groups.
+        toolbar = ttk.Frame(self.root, padding=(10, 8, 10, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(1, weight=1)
-        toolbar.columnconfigure(9, weight=1)
+        toolbar.columnconfigure(0, weight=1)
 
-        ttk.Label(toolbar, text="Workspace").grid(row=0, column=0, sticky="w")
-        ttk.Entry(toolbar, textvariable=self.workspace_var).grid(
-            row=0, column=1, sticky="ew", padx=(6, 6)
+        # ---- Row 0: workspace path + file/export/package actions ----
+        row0 = ttk.Frame(toolbar)
+        row0.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        row0.columnconfigure(1, weight=1)   # workspace Entry stretches
+
+        ttk.Label(row0, text="Workspace:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(row0, textvariable=self.workspace_var).grid(
+            row=0, column=1, sticky="ew", padx=(0, 4)
         )
-        ttk.Button(toolbar, text="Browse", command=self._choose_workspace).grid(
-            row=0, column=2, padx=(0, 6)
+        ttk.Button(row0, text="Browse", command=self._choose_workspace).grid(
+            row=0, column=2, padx=(0, 4)
         )
-        ttk.Button(toolbar, text="Reload", command=self.refresh_video_list).grid(
-            row=0, column=3, padx=(0, 10)
+        ttk.Button(row0, text="Reload", command=self.refresh_video_list).grid(
+            row=0, column=3, padx=(0, 4)
         )
         ttk.Button(
-            toolbar,
-            text="Save Progress",
+            row0, text="Save Progress",
             command=lambda: self._save_current_project(show_feedback=True),
-        ).grid(row=0, column=4, padx=(0, 10), sticky="n")
+        ).grid(row=0, column=4, padx=(0, 0))
 
-        ttk.Label(toolbar, text="Language").grid(row=0, column=5, sticky="nw")
+        ttk.Separator(row0, orient="vertical").grid(
+            row=0, column=5, sticky="ns", padx=(12, 12)
+        )
+
+        ttk.Button(row0, text="Export Current",
+                   command=self._export_current_project).grid(row=0, column=6, padx=(0, 4))
+        ttk.Button(row0, text="Export All",
+                   command=self._export_all_projects).grid(row=0, column=7, padx=(0, 0))
+
+        ttk.Separator(row0, orient="vertical").grid(
+            row=0, column=8, sticky="ns", padx=(12, 12)
+        )
+
+        ttk.Button(row0, text="Pack .asr",
+                   command=self._pack_asr).grid(row=0, column=9, padx=(0, 4))
+        ttk.Button(row0, text="Import .asr",
+                   command=self._unpack_asr).grid(row=0, column=10)
+
+        # ---- thin horizontal rule between the two toolbar rows ----
+        ttk.Separator(toolbar, orient="horizontal").grid(
+            row=1, column=0, sticky="ew", pady=(0, 6)
+        )
+
+        # ---- Row 1: download strip ----
+        row1 = ttk.Frame(toolbar)
+        row1.grid(row=2, column=0, sticky="ew")
+        row1.columnconfigure(4, weight=1)   # URL Text widget stretches
+
+        ttk.Label(row1, text="Language:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.language_combo = ttk.Combobox(
-            toolbar, textvariable=self.language_var, width=8,
+            row1, textvariable=self.language_var, width=8,
             values=["af", "en", "zu", "xh", "st", "tn", "ts", "ss", "nr", "ve",
                     "nso", "nl", "de", "fr", "es", "pt", "it", "ru", "ja", "ko",
                     "zh", "ar", "hi"],
         )
-        self.language_combo.grid(row=0, column=6, padx=(6, 2), sticky="nw")
+        self.language_combo.grid(row=0, column=1, padx=(0, 2))
         ttk.Button(
-            toolbar, text="\u21bb", width=3, command=self._fetch_available_languages,
-        ).grid(row=0, column=7, padx=(0, 6), sticky="nw")
-        ttk.Label(toolbar, text="YouTube URL(s)").grid(row=0, column=8, sticky="nw")
-        self.url_input = tk.Text(toolbar, height=3, wrap="word")
-        self.url_input.grid(row=0, column=9, sticky="ew", padx=(6, 6))
+            row1, text="\u21bb", width=3, command=self._fetch_available_languages,
+        ).grid(row=0, column=2, padx=(0, 0))
+
+        ttk.Separator(row1, orient="vertical").grid(
+            row=0, column=3, sticky="ns", padx=(10, 10)
+        )
+
+        ttk.Label(row1, text="YouTube URL(s):").grid(row=0, column=4, sticky="w", padx=(0, 6))
+        # Re-assign column weight so the URL entry (col 5) stretches
+        row1.columnconfigure(4, weight=0)
+        row1.columnconfigure(5, weight=1)
+        self.url_input = tk.Text(row1, height=2, wrap="word")
+        self.url_input.grid(row=0, column=5, sticky="ew", padx=(0, 6))
         self.url_input.bind("<Control-Return>", lambda _event: self._download_urls())
-        ttk.Button(toolbar, text="Download", command=self._download_urls).grid(
-            row=0, column=10, padx=(0, 6), sticky="n"
-        )
-        ttk.Button(
-            toolbar, text="Export Current", command=self._export_current_project
-        ).grid(row=0, column=11, padx=(0, 6), sticky="n")
-        ttk.Button(toolbar, text="Export All", command=self._export_all_projects).grid(
-            row=0, column=12, sticky="n"
-        )
-        ttk.Button(toolbar, text="Pack .asr", command=self._pack_asr).grid(
-            row=0, column=13, padx=(10, 6), sticky="n"
-        )
-        ttk.Button(toolbar, text="Import .asr", command=self._unpack_asr).grid(
-            row=0, column=14, sticky="n"
+        ttk.Button(row1, text="Download", command=self._download_urls).grid(
+            row=0, column=6, sticky="n"
         )
 
         status = ttk.Label(
             self.root,
             textvariable=self.status_var,
             anchor="w",
-            relief="groove",
-            padding=(10, 5),
+            relief="flat",
+            background="#f1f5f9",
+            foreground="#374151",
+            padding=(10, 4),
         )
         status.grid(row=2, column=0, sticky="ew")
 
         main = ttk.Panedwindow(self.root, orient="horizontal")
-        main.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        main.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 4))
 
-        videos_frame = ttk.Frame(main, padding=8)
-        editor_frame = ttk.Frame(main, padding=8)
+        videos_frame   = ttk.Frame(main, padding=8)
+        editor_frame   = ttk.Frame(main, padding=8)
         segments_frame = ttk.Frame(main, padding=8)
-        main.add(videos_frame, weight=2)
-        main.add(editor_frame, weight=5)
-        main.add(segments_frame, weight=4)
+        main.add(videos_frame,   weight=2)
+        main.add(editor_frame,   weight=6)
+        main.add(segments_frame, weight=3)
 
         videos_frame.columnconfigure(0, weight=1)
         videos_frame.rowconfigure(1, weight=1)

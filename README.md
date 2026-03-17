@@ -15,27 +15,47 @@ pip install ".[audio]"
 pip install -e ".[audio]"
 ```
 
-### System dependency
+### System dependencies
 
-**ffmpeg** must be installed and on your `PATH`.
+Two non-Python tools are required before running `pip install`:
+
+- **ffmpeg** — used for audio conversion and clip extraction. Must be on your `PATH`.
+- **tkinter** — the GUI toolkit. Bundled with most Python installers; may need a separate package on Linux.
+
+#### Quick install — use the scripts in `install/`
+
+The `install/` folder contains ready-to-run scripts that handle everything automatically for each platform. Double-click or run from a terminal — no manual steps needed.
+
+| Platform | Script | How to run | What it does |
+|---|---|---|---|
+| Windows 10 / 11 | `install\win-required.bat` | Double-click or run in CMD | Installs ffmpeg via **winget** (built into Windows). Notes tkinter requirement. |
+| Windows (any) | `install\win-required-scoop.bat` | Double-click or run in CMD | Installs **Scoop** package manager if missing, then installs ffmpeg via Scoop. |
+| Linux | `install/linux-required.sh` | `bash install/linux-required.sh` | Auto-detects **apt** (Ubuntu/Debian), **dnf** (Fedora/RHEL), or **pacman** (Arch) and installs both ffmpeg and python3-tk. |
+| macOS | `install/macos-required.sh` | `bash install/macos-required.sh` | Installs **Homebrew** if missing, then installs ffmpeg via Homebrew. Notes the tkinter/Homebrew-Python caveat. |
+
+> **Windows users:** `win-required.bat` is the recommended starting point. If winget is not available on your machine (older Windows 10), use `win-required-scoop.bat` instead.
+
+> **Linux users:** The script installs both `ffmpeg` and `python3-tk` in one step and works across the most common distros without any configuration.
+
+#### Manual install (if you prefer)
 
 ```bash
 # Windows (winget)
-winget install FFmpeg
+winget install Gyan.FFmpeg
 
 # Windows (scoop)
 scoop install ffmpeg
 
-# Linux
-sudo apt install ffmpeg
+# Linux (Debian / Ubuntu)
+sudo apt install ffmpeg python3-tk
 
 # macOS
 brew install ffmpeg
 ```
 
-### Python requirement
-
-`tkinter` must be available in your Python install. It ships with most Windows and macOS Python installers. On Linux, install your distro's `python3-tk` package if missing.
+**tkinter** ships with the standard Python installer from [python.org](https://www.python.org/downloads/).
+On Linux it may need a separate package (`python3-tk` / `python3-tkinter` / `tk` depending on distro).
+On macOS, if you installed Python via Homebrew, also run `brew install python-tk`.
 
 ## Usage
 
