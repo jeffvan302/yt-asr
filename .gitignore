@@ -32,6 +32,7 @@ htmlcov/
 # Project-specific
 tmp/
 youtube_asr_dataset/
+.b2_config.json
 
 # Editors
 .vscode/

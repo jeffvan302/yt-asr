@@ -56,7 +56,7 @@ MUSIC_ONLY_RE = re.compile(
 )
 BRACKET_STAGE_RE = re.compile(r"^\s*[\[(].*?[\])]\s*$")
 WHITESPACE_RE = re.compile(r"\s+")
-TEXT_SUFFIXES = {".json", ".json3", ".srv3", ".ttml", ".vtt"}
+TEXT_SUFFIXES = {".json", ".json3", ".srv3", ".ttml", ".vtt", ".srt", ".ass", ".ssa", ".xml"}
 
 
 @dataclass
@@ -414,6 +414,39 @@ def parse_vtt(path: Path) -> list[Segment]:
     return cues
 
 
+def parse_srt(path: Path) -> list[Segment]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    cues: list[Segment] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx].strip()
+        idx += 1
+
+        if not line:
+            continue
+        if line.isdigit() and idx < len(lines):
+            line = lines[idx].strip()
+            idx += 1
+
+        if "-->" not in line:
+            continue
+
+        start_raw, end_raw = [part.strip() for part in line.split("-->", 1)]
+        start_s = parse_timecode(start_raw.replace(",", ".").split()[0])
+        end_s = parse_timecode(end_raw.replace(",", ".").split()[0])
+
+        text_lines: list[str] = []
+        while idx < len(lines) and lines[idx].strip():
+            text_lines.append(lines[idx].strip())
+            idx += 1
+
+        text = clean_caption_text(" ".join(text_lines))
+        if text:
+            cues.append(Segment(start_s=start_s, end_s=end_s, text=text))
+
+    return cues
+
+
 def parse_json3(path: Path) -> list[Segment]:
     payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     cues: list[Segment] = []
@@ -441,10 +474,12 @@ def parse_json3(path: Path) -> list[Segment]:
 
 def load_segments(caption_path: Path) -> list[Segment]:
     suffix = caption_path.suffix.lower()
-    if suffix == ".json3":
+    if suffix in {".json", ".json3", ".srv3"}:
         return parse_json3(caption_path)
     if suffix == ".vtt":
         return parse_vtt(caption_path)
+    if suffix == ".srt":
+        return parse_srt(caption_path)
     raise RuntimeError(f"Unsupported caption format: {caption_path.suffix}")
 
 

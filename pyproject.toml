@@ -15,7 +15,8 @@ dependencies = [
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6"]
-all = ["sounddevice>=0.4.6"]
+cloud = ["boto3>=1.34", "cryptography>=42.0"]
+all   = ["sounddevice>=0.4.6", "boto3>=1.34", "cryptography>=42.0"]
 
 [project.scripts]
 yt-asr = "yt_subtitle_extract.gui:main"

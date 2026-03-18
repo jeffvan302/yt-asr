@@ -57,6 +57,43 @@ from .dataset import (
     select_caption_track,
     yt_info,
 )
+try:
+    from .cloud import (
+        B2CloudStore,
+        CloudPanel,
+        _HAS_B2,
+        _HAS_CRYPTO,
+        actor_name_for_config,
+        load_b2_config,
+        load_cloud_state,
+        lock_belongs_to,
+        remove_cloud_state_entry,
+        update_cloud_state_entry,
+    )
+    _HAS_CLOUD = True
+except ImportError:
+    _HAS_CLOUD = False
+    _HAS_B2 = False
+    _HAS_CRYPTO = False
+    B2CloudStore = None  # type: ignore[assignment]
+
+    def load_cloud_state(_workspace: Path) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def load_b2_config(_workspace: Path) -> Any:
+        return None
+
+    def update_cloud_state_entry(_workspace: Path, _video_id: str, **_updates: Any) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def remove_cloud_state_entry(_workspace: Path, _video_id: str) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def actor_name_for_config(_config: Any) -> str:
+        return ""
+
+    def lock_belongs_to(_lock: Any, _config: Any) -> bool:
+        return False
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +109,22 @@ REVIEW_MIN_DURATION_S = 0.35
 REVIEW_MAX_DURATION_S = 20.0
 REVIEW_MIN_CHARS = 2
 MARKER_HITBOX_PX = 10
+AUTO_SYNC_IDLE_TIMEOUT_S = 0.35
+IMAGE_SUBTITLE_CODECS = {
+    "dvd_subtitle",
+    "dvb_subtitle",
+    "hdmv_pgs_subtitle",
+    "xsub",
+}
+DIRECT_SUBTITLE_SUFFIXES = {".json", ".json3", ".srv3", ".vtt", ".srt"}
+MEDIA_FILETYPES = [
+    ("Media files", "*.mp4 *.mkv *.mov *.avi *.m4v *.webm *.mp3 *.m4a *.wav *.flac *.aac *.ogg"),
+    ("All files", "*.*"),
+]
+SUBTITLE_FILETYPES = [
+    ("Subtitle files", "*.vtt *.srt *.json3 *.srv3 *.json *.ass *.ssa *.ttml *.xml"),
+    ("All files", "*.*"),
+]
 
 
 @dataclass
@@ -122,6 +175,10 @@ def parse_args() -> argparse.Namespace:
 
 def ffmpeg_path() -> str | None:
     return shutil.which("ffmpeg")
+
+
+def ffprobe_path() -> str | None:
+    return shutil.which("ffprobe")
 
 
 def ensure_app_dirs(root: Path) -> dict[str, Path]:
@@ -212,6 +269,306 @@ def convert_audio_to_wav(input_audio: Path, output_wav: Path) -> Path:
     return output_wav
 
 
+def subtitle_tracks_from_probe(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    tracks: list[dict[str, Any]] = []
+    subtitle_number = 0
+    for stream in payload.get("streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        if str(stream.get("codec_type") or "").lower() != "subtitle":
+            continue
+        subtitle_number += 1
+        tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
+        disposition = (
+            stream.get("disposition")
+            if isinstance(stream.get("disposition"), dict)
+            else {}
+        )
+        codec = str(stream.get("codec_name") or "").strip().lower()
+        language = str(
+            tags.get("language")
+            or tags.get("LANGUAGE")
+            or tags.get("lang")
+            or ""
+        ).strip()
+        title = str(
+            tags.get("title")
+            or tags.get("handler_name")
+            or tags.get("HANDLER_NAME")
+            or ""
+        ).strip()
+        supported = codec not in IMAGE_SUBTITLE_CODECS
+        display_parts = [
+            language or "und",
+            title or f"Subtitle {subtitle_number}",
+            codec or "unknown codec",
+        ]
+        if disposition.get("default"):
+            display_parts.append("default")
+        if not supported:
+            display_parts.append("unsupported")
+        tracks.append(
+            {
+                "stream_index": int(stream.get("index", subtitle_number - 1)),
+                "subtitle_number": subtitle_number,
+                "language": language,
+                "title": title,
+                "codec": codec,
+                "supported": supported,
+                "default": bool(disposition.get("default")),
+                "display": " | ".join(display_parts),
+            }
+        )
+    return tracks
+
+
+def list_embedded_subtitle_tracks(media_path: Path) -> list[dict[str, Any]]:
+    ffprobe = ffprobe_path()
+    if ffprobe is None:
+        raise RuntimeError("ffprobe was not found on PATH.")
+
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        str(media_path),
+    ]
+    kwargs = _subprocess_kwargs()
+    kwargs["stdout"] = subprocess.PIPE
+    result = subprocess.run(command, check=False, timeout=120, **kwargs)
+    if result.returncode != 0:
+        stderr_text = (result.stderr or b"").decode(errors="replace").strip()
+        raise RuntimeError(f"ffprobe failed: {stderr_text or 'unknown error'}")
+    try:
+        payload = json.loads((result.stdout or b"{}").decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Could not parse ffprobe output: {exc}") from exc
+    return subtitle_tracks_from_probe(payload)
+
+
+def convert_subtitle_to_vtt(source_path: Path, dest_vtt: Path) -> Path:
+    ffmpeg = ffmpeg_path()
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg was not found on PATH.")
+    command = [
+        ffmpeg,
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(source_path),
+        "-c:s",
+        "webvtt",
+        str(dest_vtt),
+    ]
+    result = subprocess.run(command, check=False, timeout=600, **_subprocess_kwargs())
+    if result.returncode != 0:
+        stderr_text = (result.stderr or b"").decode(errors="replace").strip()
+        raise RuntimeError(
+            f"Subtitle conversion failed: {stderr_text or 'unknown error'}"
+        )
+    return dest_vtt
+
+
+def extract_embedded_subtitle_to_vtt(
+    media_path: Path,
+    stream_index: int,
+    dest_vtt: Path,
+) -> Path:
+    ffmpeg = ffmpeg_path()
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg was not found on PATH.")
+    command = [
+        ffmpeg,
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(media_path),
+        "-map",
+        f"0:{stream_index}",
+        "-c:s",
+        "webvtt",
+        str(dest_vtt),
+    ]
+    result = subprocess.run(command, check=False, timeout=600, **_subprocess_kwargs())
+    if result.returncode != 0:
+        stderr_text = (result.stderr or b"").decode(errors="replace").strip()
+        raise RuntimeError(
+            f"Subtitle extraction failed: {stderr_text or 'unknown error'}"
+        )
+    return dest_vtt
+
+
+def make_unique_local_video_id(root: Path, preferred_name: str) -> str:
+    base = sanitize_filename(preferred_name) or "local_media"
+    candidate = base
+    suffix = 2
+    while project_path(root, candidate).exists() or metadata_path(root, candidate).exists():
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def copy_or_prepare_local_subtitle(
+    source_path: Path,
+    dest_dir: Path,
+    video_id: str,
+    caption_language: str,
+) -> Path:
+    lang_slug = sanitize_filename(caption_language or "und")
+    suffix = source_path.suffix.lower()
+    if suffix in DIRECT_SUBTITLE_SUFFIXES:
+        dest_path = dest_dir / f"{sanitize_filename(video_id)}.{lang_slug}{suffix}"
+        if source_path.resolve() != dest_path.resolve():
+            shutil.copy2(source_path, dest_path)
+        return dest_path
+
+    dest_path = dest_dir / f"{sanitize_filename(video_id)}.{lang_slug}.vtt"
+    return convert_subtitle_to_vtt(source_path, dest_path)
+
+
+def create_project_from_local_media(
+    root: Path,
+    media_path: Path,
+    *,
+    title: str,
+    channel: str,
+    caption_language: str,
+    subtitle_mode: str,
+    subtitle_stream_index: int | None = None,
+    subtitle_file: Path | None = None,
+    status_hook: Callable[[str], None] | None = None,
+) -> VideoProject:
+    def _status(message: str) -> None:
+        if status_hook is not None:
+            status_hook(message)
+
+    dirs = ensure_app_dirs(root)
+    resolved_media = media_path.resolve()
+    if not resolved_media.exists():
+        raise RuntimeError(f"Media file does not exist: {resolved_media}")
+
+    final_title = title.strip() or resolved_media.stem
+    final_channel = channel.strip()
+    final_language = caption_language.strip() or "und"
+    video_id = make_unique_local_video_id(root, final_title or resolved_media.stem)
+
+    caption_dest_dir = dirs["captions"]
+    audio_dest = dirs["working_audio"] / f"{sanitize_filename(video_id)}.wav"
+
+    _status("Preparing subtitle file...")
+    if subtitle_mode == "embedded":
+        if subtitle_stream_index is None:
+            raise RuntimeError("Select an embedded subtitle track to import.")
+        caption_path = caption_dest_dir / (
+            f"{sanitize_filename(video_id)}.{sanitize_filename(final_language)}.vtt"
+        )
+        extract_embedded_subtitle_to_vtt(
+            resolved_media,
+            subtitle_stream_index,
+            caption_path,
+        )
+    elif subtitle_mode == "external":
+        if subtitle_file is None:
+            raise RuntimeError("Select a subtitle file to import.")
+        caption_path = copy_or_prepare_local_subtitle(
+            subtitle_file.resolve(),
+            caption_dest_dir,
+            video_id,
+            final_language,
+        )
+    else:
+        raise RuntimeError(f"Unsupported subtitle mode: {subtitle_mode}")
+
+    _status("Extracting audio...")
+    working_audio = convert_audio_to_wav(resolved_media, audio_dest)
+    duration = wave_duration_s(working_audio)
+    segments = build_segments_from_caption(caption_path)
+    now = time.time()
+
+    project = VideoProject(
+        version=PROJECT_VERSION,
+        video_id=video_id,
+        title=final_title,
+        channel=final_channel,
+        webpage_url=resolved_media.as_uri(),
+        duration=duration,
+        caption_language=final_language,
+        caption_file=str(_to_relative(caption_path, root)),
+        audio_file=str(_to_relative(working_audio, root)),
+        working_audio_file=str(_to_relative(working_audio, root)),
+        created_at=now,
+        updated_at=now,
+        segments=segments,
+    )
+    save_project(project_path(root, video_id), project)
+    write_json(
+        metadata_path(root, video_id),
+        {
+            "id": video_id,
+            "title": final_title,
+            "channel": final_channel,
+            "webpage_url": resolved_media.as_uri(),
+            "duration": duration,
+            "caption_language": final_language,
+            "caption_file": str(_to_relative(caption_path, root)),
+            "audio_file": str(_to_relative(working_audio, root)),
+        },
+    )
+    return project
+
+
+def _path_is_within_workspace(path: Path, workspace: Path) -> bool:
+    try:
+        path.resolve().relative_to(workspace.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def delete_local_title_data(root: Path, video_id: str) -> list[Path]:
+    tracked_files: set[Path] = set()
+    removed: list[Path] = []
+
+    project_file = project_path(root, video_id)
+    metadata_file = metadata_path(root, video_id)
+    for manifest_path in (project_file, metadata_file):
+        if not manifest_path.exists():
+            continue
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        for key in ("caption_file", "audio_file", "working_audio_file"):
+            raw_path = payload.get(key)
+            if not raw_path:
+                continue
+            resolved = resolve_path(str(raw_path), root)
+            if _path_is_within_workspace(resolved, root):
+                tracked_files.add(resolved)
+
+    for manifest_path in (project_file, metadata_file):
+        if manifest_path.exists():
+            tracked_files.add(manifest_path.resolve())
+
+    for path in sorted(tracked_files, key=lambda item: len(str(item)), reverse=True):
+        if not path.exists() or not path.is_file():
+            continue
+        path.unlink(missing_ok=True)
+        removed.append(path)
+
+    clip_dir = root / "exports" / "clips" / sanitize_filename(video_id)
+    if clip_dir.exists() and clip_dir.is_dir() and _path_is_within_workspace(clip_dir, root):
+        shutil.rmtree(clip_dir, ignore_errors=True)
+        removed.append(clip_dir)
+
+    return removed
+
+
 def wave_duration_s(wav_path: Path) -> float:
     with wave.open(str(wav_path), "rb") as wav_file:
         frames = wav_file.getnframes()
@@ -250,6 +607,7 @@ def video_summary_from_metadata(path: Path) -> dict[str, Any]:
 def discover_videos(root: Path) -> list[dict[str, Any]]:
     dirs = ensure_app_dirs(root)
     by_id: dict[str, dict[str, Any]] = {}
+    cloud_state = load_cloud_state(root)
 
     for path in sorted(dirs["metadata"].glob("*.json")):
         summary = video_summary_from_metadata(path)
@@ -259,7 +617,42 @@ def discover_videos(root: Path) -> list[dict[str, Any]]:
         summary = video_summary_from_project(path)
         by_id[summary["video_id"]] = summary
 
-    return sorted(by_id.values(), key=lambda item: item["title"].lower())
+    summaries: list[dict[str, Any]] = []
+    for video_id, summary in by_id.items():
+        cloud_entry = cloud_state.get(video_id, {})
+        cloud_status = str(cloud_entry.get("cloud_state") or "").strip()
+        lock_user = str(cloud_entry.get("lock_user") or "").strip()
+
+        match cloud_status:
+            case "checked_out_self":
+                state_label = "Checked Out"
+                sort_group = 0
+                read_only = False
+            case "checked_in":
+                state_label = "Checked In"
+                sort_group = 1
+                read_only = True
+            case "checked_out_other":
+                state_label = f"Locked: {lock_user}" if lock_user else "Locked"
+                sort_group = 1
+                read_only = True
+            case _:
+                state_label = "Reviewed" if summary["source"] == "project" else "Downloaded"
+                sort_group = 1
+                read_only = False
+
+        merged = dict(summary)
+        merged["cloud_state"] = cloud_status
+        merged["lock_user"] = lock_user
+        merged["state_label"] = state_label
+        merged["read_only"] = read_only
+        merged["_sort_group"] = sort_group
+        summaries.append(merged)
+
+    return sorted(
+        summaries,
+        key=lambda item: (int(item.get("_sort_group", 1)), item["title"].lower()),
+    )
 
 
 def segment_from_payload(payload: dict[str, Any]) -> EditableSegment:
@@ -817,6 +1210,265 @@ class TitleSelectDialog(tk.Toplevel):
         self.destroy()
 
 
+class LocalMediaImportDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, default_language: str) -> None:
+        super().__init__(parent)
+        self.title("Import Local Media")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.result: dict[str, Any] | None = None
+        self._embedded_tracks: list[dict[str, Any]] = []
+
+        self._media_path_var = tk.StringVar()
+        self._subtitle_file_var = tk.StringVar()
+        self._title_var = tk.StringVar()
+        self._channel_var = tk.StringVar()
+        self._caption_language_var = tk.StringVar(value=default_language or "und")
+        self._subtitle_mode_var = tk.StringVar(value="embedded")
+        self._track_note_var = tk.StringVar(value="Choose a media file to inspect subtitle tracks.")
+
+        self._build()
+        self.update_idletasks()
+
+        w = 760
+        h = 540
+        px = parent.winfo_rootx() + parent.winfo_width() // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"{w}x{h}+{px - w // 2}+{py - h // 2}")
+        self.minsize(620, 440)
+
+        self.wait_window()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        form = ttk.Frame(self, padding=12)
+        form.grid(row=0, column=0, sticky="nsew")
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(2, weight=0)
+
+        ttk.Label(form, text="Media file:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Entry(form, textvariable=self._media_path_var).grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        ttk.Button(form, text="Browse", command=self._browse_media).grid(row=0, column=2, padx=(6, 0), pady=(0, 6))
+
+        ttk.Label(form, text="Title:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Entry(form, textvariable=self._title_var).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 6))
+
+        ttk.Label(form, text="Channel:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Entry(form, textvariable=self._channel_var).grid(row=2, column=1, columnspan=2, sticky="ew", pady=(0, 6))
+
+        ttk.Label(form, text="Caption language:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Entry(form, textvariable=self._caption_language_var, width=14).grid(
+            row=3, column=1, sticky="w", pady=(0, 6)
+        )
+        ttk.Label(form, text="Use codes like en, af, en-US", foreground="#6b7280").grid(
+            row=3, column=2, sticky="w", padx=(6, 0), pady=(0, 6)
+        )
+
+        source_lf = ttk.LabelFrame(self, text="Subtitle Source", padding=12)
+        source_lf.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        source_lf.columnconfigure(0, weight=1)
+        source_lf.rowconfigure(2, weight=1)
+
+        ttk.Radiobutton(
+            source_lf,
+            text="Use an embedded subtitle track from the media file",
+            variable=self._subtitle_mode_var,
+            value="embedded",
+            command=self._update_source_mode,
+        ).grid(row=0, column=0, sticky="w")
+
+        embedded_frame = ttk.Frame(source_lf)
+        embedded_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 10))
+        embedded_frame.columnconfigure(0, weight=1)
+        embedded_frame.rowconfigure(0, weight=1)
+
+        self._embedded_list = tk.Listbox(embedded_frame, height=8, exportselection=False)
+        self._embedded_list.grid(row=0, column=0, sticky="nsew")
+        self._embedded_list.bind("<<ListboxSelect>>", self._on_track_selected)
+        embedded_scroll = ttk.Scrollbar(
+            embedded_frame,
+            orient="vertical",
+            command=self._embedded_list.yview,
+        )
+        embedded_scroll.grid(row=0, column=1, sticky="ns")
+        self._embedded_list.configure(yscrollcommand=embedded_scroll.set)
+        ttk.Label(
+            source_lf,
+            textvariable=self._track_note_var,
+            foreground="#6b7280",
+            wraplength=680,
+        ).grid(row=2, column=0, sticky="ew", pady=(0, 10))
+
+        ttk.Radiobutton(
+            source_lf,
+            text="Use a separate subtitle file",
+            variable=self._subtitle_mode_var,
+            value="external",
+            command=self._update_source_mode,
+        ).grid(row=3, column=0, sticky="w")
+
+        external_row = ttk.Frame(source_lf)
+        external_row.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        external_row.columnconfigure(0, weight=1)
+        self._subtitle_entry = ttk.Entry(external_row, textvariable=self._subtitle_file_var)
+        self._subtitle_entry.grid(row=0, column=0, sticky="ew")
+        self._subtitle_browse_btn = ttk.Button(
+            external_row,
+            text="Browse",
+            command=self._browse_subtitle_file,
+        )
+        self._subtitle_browse_btn.grid(row=0, column=1, padx=(6, 0))
+
+        btn_row = ttk.Frame(self, padding=(12, 0, 12, 12))
+        btn_row.grid(row=2, column=0, sticky="e")
+        ttk.Button(btn_row, text="Cancel", command=self._cancel, width=12).pack(side="right")
+        ttk.Button(btn_row, text="Import", command=self._ok, width=12).pack(side="right", padx=(0, 8))
+
+        self._update_source_mode()
+
+    def _browse_media(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Select media file",
+            filetypes=MEDIA_FILETYPES,
+        )
+        if not selected:
+            return
+        media_path = Path(selected)
+        self._media_path_var.set(str(media_path))
+        if not self._title_var.get().strip():
+            self._title_var.set(media_path.stem)
+        self._scan_embedded_tracks(media_path)
+
+    def _browse_subtitle_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Select subtitle file",
+            filetypes=SUBTITLE_FILETYPES,
+        )
+        if not selected:
+            return
+        self._subtitle_file_var.set(selected)
+        self._subtitle_mode_var.set("external")
+        self._update_source_mode()
+
+    def _scan_embedded_tracks(self, media_path: Path) -> None:
+        self._embedded_tracks = []
+        self._embedded_list.delete(0, "end")
+        try:
+            tracks = list_embedded_subtitle_tracks(media_path)
+        except Exception as exc:
+            self._track_note_var.set(f"Could not inspect embedded subtitles: {exc}")
+            return
+
+        self._embedded_tracks = tracks
+        if not tracks:
+            self._track_note_var.set("No embedded subtitle tracks were found. Choose a separate subtitle file instead.")
+            self._subtitle_mode_var.set("external")
+            self._update_source_mode()
+            return
+
+        for track in tracks:
+            self._embedded_list.insert("end", track["display"])
+
+        preferred_index = 0
+        for idx, track in enumerate(tracks):
+            if track.get("default"):
+                preferred_index = idx
+                break
+        self._embedded_list.selection_clear(0, "end")
+        self._embedded_list.selection_set(preferred_index)
+        self._embedded_list.activate(preferred_index)
+        self._embedded_list.see(preferred_index)
+        self._subtitle_mode_var.set("embedded")
+        self._update_source_mode()
+        self._on_track_selected()
+
+        supported = sum(1 for track in tracks if track.get("supported"))
+        unsupported = len(tracks) - supported
+        note = f"Found {len(tracks)} embedded subtitle track(s)."
+        if unsupported:
+            note += f" {unsupported} track(s) appear image-based and may not import."
+        self._track_note_var.set(note)
+
+    def _update_source_mode(self) -> None:
+        embedded_mode = self._subtitle_mode_var.get() == "embedded"
+        self._embedded_list.configure(state="normal" if embedded_mode else "disabled")
+        self._subtitle_entry.state(["disabled"] if embedded_mode else ["!disabled"])
+        self._subtitle_browse_btn.state(["disabled"] if embedded_mode else ["!disabled"])
+
+    def _selected_track(self) -> dict[str, Any] | None:
+        selection = self._embedded_list.curselection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        if 0 <= index < len(self._embedded_tracks):
+            return self._embedded_tracks[index]
+        return None
+
+    def _on_track_selected(self, _event: Any = None) -> None:
+        track = self._selected_track()
+        if not track:
+            return
+        language = str(track.get("language") or "").strip()
+        if language:
+            self._caption_language_var.set(language)
+
+    def _ok(self) -> None:
+        media_path = Path(self._media_path_var.get().strip()) if self._media_path_var.get().strip() else None
+        if media_path is None or not media_path.exists():
+            messagebox.showwarning("Missing media", "Choose a media file to import.", parent=self)
+            return
+
+        title = self._title_var.get().strip() or media_path.stem
+        caption_language = self._caption_language_var.get().strip() or "und"
+        subtitle_mode = self._subtitle_mode_var.get().strip() or "embedded"
+
+        subtitle_file: Path | None = None
+        subtitle_stream_index: int | None = None
+        if subtitle_mode == "embedded":
+            track = self._selected_track()
+            if not track:
+                messagebox.showwarning("No subtitle track", "Select an embedded subtitle track first.", parent=self)
+                return
+            if not track.get("supported"):
+                messagebox.showwarning(
+                    "Unsupported subtitle track",
+                    "That embedded subtitle track looks image-based. Choose a different track or use a separate subtitle file.",
+                    parent=self,
+                )
+                return
+            subtitle_stream_index = int(track["stream_index"])
+            if not self._caption_language_var.get().strip():
+                self._caption_language_var.set(str(track.get("language") or "und"))
+                caption_language = self._caption_language_var.get().strip() or "und"
+        else:
+            subtitle_raw = self._subtitle_file_var.get().strip()
+            subtitle_file = Path(subtitle_raw) if subtitle_raw else None
+            if subtitle_file is None or not subtitle_file.exists():
+                messagebox.showwarning("Missing subtitle file", "Choose a subtitle file to import.", parent=self)
+                return
+
+        self.result = {
+            "media_path": media_path.resolve(),
+            "title": title,
+            "channel": self._channel_var.get().strip(),
+            "caption_language": caption_language,
+            "subtitle_mode": subtitle_mode,
+            "subtitle_stream_index": subtitle_stream_index,
+            "subtitle_file": subtitle_file.resolve() if subtitle_file else None,
+        }
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class ASRReviewApp:
     def __init__(self, root: tk.Tk, workspace: Path, language: str) -> None:
         self.root = root
@@ -828,9 +1480,16 @@ class ASRReviewApp:
         self.worker_thread: threading.Thread | None = None
         self.worker_done_callback: Any = None
         self.active_job_key: str | None = None
+        self._auto_sync_queue: queue.Queue[tuple[Path, str, float]] = queue.Queue()
+        self._auto_sync_result_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._auto_sync_thread: threading.Thread | None = None
+        self._auto_sync_lock = threading.Lock()
 
         self.video_summaries: list[dict[str, Any]] = []
+        self._video_summary_by_id: dict[str, dict[str, Any]] = {}
         self.current_project: VideoProject | None = None
+        self.current_video_summary: dict[str, Any] | None = None
+        self.current_read_only = False
         self.current_segment_index: int | None = None
         self.view_start_s = 0.0
         self.view_span_s = DEFAULT_VIEW_SPAN_S
@@ -907,10 +1566,11 @@ class ASRReviewApp:
         ttk.Button(row0, text="Reload", command=self.refresh_video_list).grid(
             row=0, column=3, padx=(0, 4)
         )
-        ttk.Button(
+        self._save_progress_btn = ttk.Button(
             row0, text="Save Progress",
             command=lambda: self._save_current_project(show_feedback=True),
-        ).grid(row=0, column=4, padx=(0, 0))
+        )
+        self._save_progress_btn.grid(row=0, column=4, padx=(0, 0))
 
         ttk.Separator(row0, orient="vertical").grid(
             row=0, column=5, sticky="ns", padx=(12, 12)
@@ -929,6 +1589,12 @@ class ASRReviewApp:
                    command=self._pack_asr).grid(row=0, column=9, padx=(0, 4))
         ttk.Button(row0, text="Import .asr",
                    command=self._unpack_asr).grid(row=0, column=10)
+
+        ttk.Separator(row0, orient="vertical").grid(
+            row=0, column=11, sticky="ns", padx=(12, 12)
+        )
+        ttk.Button(row0, text="☁  Cloud",
+                   command=self._open_cloud_panel).grid(row=0, column=12)
 
         # ---- thin horizontal rule between the two toolbar rows ----
         ttk.Separator(toolbar, orient="horizontal").grid(
@@ -966,6 +1632,9 @@ class ASRReviewApp:
         ttk.Button(row1, text="Download", command=self._download_urls).grid(
             row=0, column=6, sticky="n"
         )
+        ttk.Button(row1, text="Import Media...", command=self._import_local_media).grid(
+            row=0, column=7, sticky="n", padx=(6, 0)
+        )
 
         status = ttk.Label(
             self.root,
@@ -990,7 +1659,7 @@ class ASRReviewApp:
 
         videos_frame.columnconfigure(0, weight=1)
         videos_frame.rowconfigure(1, weight=1)
-        ttk.Label(videos_frame, text="Downloaded Videos").grid(
+        ttk.Label(videos_frame, text="Workspace Titles").grid(
             row=0, column=0, sticky="w", pady=(0, 6)
         )
         self.video_tree = ttk.Treeview(
@@ -1005,8 +1674,11 @@ class ASRReviewApp:
         self.video_tree.heading("segments", text="Phrases")
         self.video_tree.column("#0", width=240, stretch=True)
         self.video_tree.column("channel", width=120, stretch=True)
-        self.video_tree.column("state", width=80, stretch=False, anchor="center")
+        self.video_tree.column("state", width=120, stretch=False, anchor="center")
         self.video_tree.column("segments", width=70, stretch=False, anchor="e")
+        self.video_tree.tag_configure("checked_out", foreground="#1d4ed8")
+        self.video_tree.tag_configure("checked_in", foreground="#6b7280")
+        self.video_tree.tag_configure("locked", foreground="#b45309")
         self.video_tree.grid(row=1, column=0, sticky="nsew")
         self.video_tree.bind("<<TreeviewSelect>>", self._on_video_selected)
         video_scroll = ttk.Scrollbar(
@@ -1014,6 +1686,15 @@ class ASRReviewApp:
         )
         video_scroll.grid(row=1, column=1, sticky="ns")
         self.video_tree.configure(yscrollcommand=video_scroll.set)
+
+        video_actions = ttk.Frame(videos_frame, padding=(0, 8, 0, 0))
+        video_actions.grid(row=2, column=0, sticky="ew")
+        self._delete_local_btn = ttk.Button(
+            video_actions,
+            text="Delete Local Copy",
+            command=self._delete_local_copy,
+        )
+        self._delete_local_btn.pack(side="left")
 
         editor_frame.columnconfigure(0, weight=1)
         editor_frame.rowconfigure(3, weight=1)
@@ -1024,7 +1705,8 @@ class ASRReviewApp:
             font=("Segoe UI", 12, "bold"),
         ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-        ttk.Label(editor_frame, text="Caption Text (editable)").grid(
+        self.caption_text_label_var = tk.StringVar(value="Caption Text (editable)")
+        ttk.Label(editor_frame, textvariable=self.caption_text_label_var).grid(
             row=1, column=0, sticky="w", pady=(0, 4)
         )
         self.preview_text = tk.Text(
@@ -1062,17 +1744,22 @@ class ASRReviewApp:
         playback_frame.grid(row=4, column=0, sticky="ew")
 
         self._play_btn = ttk.Button(playback_frame, text="Play", width=6,
-                                     command=self._playback_play)
+                                    command=self._playback_play)
         self._play_btn.pack(side="left", padx=(0, 4))
         self._pause_btn = ttk.Button(playback_frame, text="Pause", width=6,
-                                      command=self._playback_pause)
+                                     command=self._playback_pause)
         self._pause_btn.pack(side="left", padx=(0, 4))
         self._stop_btn = ttk.Button(playback_frame, text="Stop", width=6,
-                                     command=self._playback_stop)
+                                    command=self._playback_stop)
         self._stop_btn.pack(side="left", padx=(0, 10))
         self._loop_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(playback_frame, text="Loop", variable=self._loop_var,
-                         command=self._on_loop_toggled).pack(side="left", padx=(0, 10))
+        self._loop_btn = ttk.Checkbutton(
+            playback_frame,
+            text="Loop",
+            variable=self._loop_var,
+            command=self._on_loop_toggled,
+        )
+        self._loop_btn.pack(side="left", padx=(0, 10))
         self._playback_status_var = tk.StringVar(value="")
         ttk.Label(playback_frame, textvariable=self._playback_status_var,
                   foreground="#4b5563").pack(side="left")
@@ -1093,51 +1780,45 @@ class ASRReviewApp:
         ttk.Label(controls, textvariable=self.segment_label_var).grid(
             row=0, column=0, columnspan=12, sticky="w", pady=(0, 8)
         )
-        ttk.Button(controls, text="Previous", command=self._select_previous_segment).grid(
-            row=1, column=0, padx=(0, 6)
-        )
-        ttk.Button(controls, text="Next", command=self._select_next_segment).grid(
-            row=1, column=1, padx=(0, 12)
-        )
-        ttk.Button(controls, text="Zoom In", command=lambda: self._zoom(0.7)).grid(
-            row=1, column=2, padx=(0, 6)
-        )
-        ttk.Button(controls, text="Zoom Out", command=lambda: self._zoom(1.4)).grid(
-            row=1, column=3, padx=(0, 12)
-        )
+        self._previous_btn = ttk.Button(controls, text="Previous", command=self._select_previous_segment)
+        self._previous_btn.grid(row=1, column=0, padx=(0, 6))
+        self._next_btn = ttk.Button(controls, text="Next", command=self._select_next_segment)
+        self._next_btn.grid(row=1, column=1, padx=(0, 12))
+        self._zoom_in_btn = ttk.Button(controls, text="Zoom In", command=lambda: self._zoom(0.7))
+        self._zoom_in_btn.grid(row=1, column=2, padx=(0, 6))
+        self._zoom_out_btn = ttk.Button(controls, text="Zoom Out", command=lambda: self._zoom(1.4))
+        self._zoom_out_btn.grid(row=1, column=3, padx=(0, 12))
         ttk.Label(controls, text="Start (s)").grid(row=1, column=4, sticky="w")
-        start_entry = ttk.Entry(controls, textvariable=self.start_var, width=10)
-        start_entry.grid(row=1, column=5, padx=(6, 10))
-        start_entry.bind("<Return>", lambda _event: self._apply_time_entries())
+        self._start_entry = ttk.Entry(controls, textvariable=self.start_var, width=10)
+        self._start_entry.grid(row=1, column=5, padx=(6, 10))
+        self._start_entry.bind("<Return>", lambda _event: self._apply_time_entries())
         ttk.Label(controls, text="End (s)").grid(row=1, column=6, sticky="w")
-        end_entry = ttk.Entry(controls, textvariable=self.end_var, width=10)
-        end_entry.grid(row=1, column=7, padx=(6, 10))
-        end_entry.bind("<Return>", lambda _event: self._apply_time_entries())
-        ttk.Button(controls, text="Apply", command=self._apply_time_entries).grid(
-            row=1, column=8, padx=(0, 6)
-        )
-        ttk.Button(controls, text="Reset Segment", command=self._reset_current_segment).grid(
-            row=1, column=9, padx=(0, 10)
-        )
-        ttk.Checkbutton(
+        self._end_entry = ttk.Entry(controls, textvariable=self.end_var, width=10)
+        self._end_entry.grid(row=1, column=7, padx=(6, 10))
+        self._end_entry.bind("<Return>", lambda _event: self._apply_time_entries())
+        self._apply_btn = ttk.Button(controls, text="Apply", command=self._apply_time_entries)
+        self._apply_btn.grid(row=1, column=8, padx=(0, 6))
+        self._reset_btn = ttk.Button(controls, text="Reset Segment", command=self._reset_current_segment)
+        self._reset_btn.grid(row=1, column=9, padx=(0, 10))
+        self._enabled_check = ttk.Checkbutton(
             controls,
             text="Include in export",
             variable=self.enabled_var,
             command=self._toggle_current_segment_enabled,
-        ).grid(row=1, column=10, sticky="w", padx=(0, 10))
-        ttk.Checkbutton(
+        )
+        self._enabled_check.grid(row=1, column=10, sticky="w", padx=(0, 10))
+        self._reviewed_check = ttk.Checkbutton(
             controls,
             text="Reviewed",
             variable=self.reviewed_var,
             command=self._toggle_current_segment_reviewed,
-        ).grid(row=1, column=11, sticky="w")
+        )
+        self._reviewed_check.grid(row=1, column=11, sticky="w")
 
-        ttk.Button(controls, text="Split at Cursor", command=self._split_at_cursor).grid(
-            row=2, column=0, columnspan=2, padx=(0, 6), pady=(8, 0), sticky="w"
-        )
-        ttk.Button(controls, text="Combine Selected", command=self._combine_segments).grid(
-            row=2, column=2, columnspan=2, padx=(0, 12), pady=(8, 0), sticky="w"
-        )
+        self._split_btn = ttk.Button(controls, text="Split at Cursor", command=self._split_at_cursor)
+        self._split_btn.grid(row=2, column=0, columnspan=2, padx=(0, 6), pady=(8, 0), sticky="w")
+        self._combine_btn = ttk.Button(controls, text="Combine Selected", command=self._combine_segments)
+        self._combine_btn.grid(row=2, column=2, columnspan=2, padx=(0, 12), pady=(8, 0), sticky="w")
         help_text = (
             "Drag markers or scroll to pan. "
             "Split: place cursor in text, click Split. "
@@ -1201,6 +1882,76 @@ class ASRReviewApp:
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
 
+    def _current_cloud_state(self) -> str:
+        if not self.current_video_summary:
+            return ""
+        return str(self.current_video_summary.get("cloud_state") or "").strip()
+
+    def _current_lock_user(self) -> str:
+        if not self.current_video_summary:
+            return ""
+        return str(self.current_video_summary.get("lock_user") or "").strip()
+
+    def _apply_editor_access_state(self) -> None:
+        cloud_state = self._current_cloud_state()
+        lock_user = self._current_lock_user()
+        self.current_read_only = bool(
+            self.current_video_summary and self.current_video_summary.get("read_only")
+        )
+
+        state_suffix = ""
+        if cloud_state == "checked_in":
+            state_suffix = "  |  Checked in (read-only)"
+        elif cloud_state == "checked_out_self":
+            state_suffix = "  |  Checked out"
+        elif cloud_state == "checked_out_other":
+            locker = lock_user or "someone else"
+            state_suffix = f"  |  Locked by {locker} (read-only)"
+
+        if self.current_project:
+            self.video_label_var.set(
+                f"{self.current_project.title}  |  "
+                f"{self.current_project.channel or 'Unknown channel'}  |  "
+                f"{len(self.current_project.segments)} phrases"
+                f"{state_suffix}"
+            )
+        self.caption_text_label_var.set(
+            "Caption Text (read-only)" if self.current_read_only else "Caption Text (editable)"
+        )
+
+        text_state = "disabled" if self.current_read_only else "normal"
+        self.preview_text.config(state="normal")
+        if self.current_read_only:
+            self.preview_text.config(state="disabled")
+
+        button_state = ["disabled"] if self.current_read_only else ["!disabled"]
+        check_state = ["disabled"] if self.current_read_only else ["!disabled"]
+
+        self._start_entry.state(["disabled"] if self.current_read_only else ["!disabled"])
+        self._end_entry.state(["disabled"] if self.current_read_only else ["!disabled"])
+        self._apply_btn.state(button_state)
+        self._reset_btn.state(button_state)
+        self._enabled_check.state(check_state)
+        self._reviewed_check.state(check_state)
+        self._split_btn.state(button_state)
+        self._combine_btn.state(button_state)
+        if hasattr(self, "_save_progress_btn"):
+            self._save_progress_btn.state(button_state)
+
+    def _ensure_project_editable(self, action: str = "edit this title") -> bool:
+        if not self.current_read_only:
+            return True
+        cloud_state = self._current_cloud_state()
+        if cloud_state == "checked_in":
+            detail = "It is checked in and read-only locally."
+        elif cloud_state == "checked_out_other":
+            locker = self._current_lock_user() or "someone else"
+            detail = f"It is checked out by {locker} and read-only locally."
+        else:
+            detail = "It is read-only right now."
+        self._set_status(f"Cannot {action}. {detail}")
+        return False
+
     def _choose_workspace(self) -> None:
         self._save_current_project()
         selected = filedialog.askdirectory(initialdir=str(self.workspace))
@@ -1210,6 +1961,8 @@ class ASRReviewApp:
         self.workspace_var.set(str(self.workspace))
         self.dirs = ensure_app_dirs(self.workspace)
         self.current_project = None
+        self.current_video_summary = None
+        self.current_read_only = False
         self.current_segment_index = None
         self.view_start_s = 0.0
         self.view_span_s = DEFAULT_VIEW_SPAN_S
@@ -1253,6 +2006,7 @@ class ASRReviewApp:
         return True
 
     def _poll_worker_queue(self) -> None:
+        self._poll_auto_sync_results()
         try:
             while True:
                 kind, payload = self.worker_queue.get_nowait()
@@ -1289,6 +2043,214 @@ class ASRReviewApp:
             except tk.TclError:
                 return
 
+    def _poll_auto_sync_results(self) -> None:
+        try:
+            while True:
+                self._handle_auto_sync_result(self._auto_sync_result_queue.get_nowait())
+        except queue.Empty:
+            return
+
+    def _queue_auto_sync(self, workspace: Path, video_id: str, updated_at: float) -> None:
+        if not (_HAS_CLOUD and _HAS_B2):
+            return
+        self._auto_sync_queue.put((workspace.resolve(), video_id, float(updated_at or 0.0)))
+        with self._auto_sync_lock:
+            if self._auto_sync_thread and self._auto_sync_thread.is_alive():
+                return
+            self._auto_sync_thread = threading.Thread(
+                target=self._auto_sync_loop,
+                name="cloud-auto-sync",
+                daemon=True,
+            )
+            self._auto_sync_thread.start()
+
+    def _auto_sync_loop(self) -> None:
+        while True:
+            batch = self._dequeue_auto_sync_batch()
+            if not batch:
+                with self._auto_sync_lock:
+                    if self._auto_sync_queue.empty():
+                        self._auto_sync_thread = None
+                        return
+                continue
+
+            for workspace, video_id, target_updated_at in batch:
+                self._auto_sync_result_queue.put(
+                    self._auto_sync_one(workspace, video_id, target_updated_at)
+                )
+
+    def _dequeue_auto_sync_batch(self) -> list[tuple[Path, str, float]]:
+        try:
+            first = self._auto_sync_queue.get(timeout=AUTO_SYNC_IDLE_TIMEOUT_S)
+        except queue.Empty:
+            return []
+
+        pending: dict[tuple[str, str], tuple[Path, str, float]] = {
+            (str(first[0]), first[1]): first,
+        }
+        while True:
+            try:
+                workspace, video_id, updated_at = self._auto_sync_queue.get_nowait()
+            except queue.Empty:
+                break
+            key = (str(workspace), video_id)
+            previous = pending.get(key)
+            if previous is None or float(updated_at or 0.0) >= previous[2]:
+                pending[key] = (workspace, video_id, float(updated_at or 0.0))
+        return list(pending.values())
+
+    def _auto_sync_one(
+        self,
+        workspace: Path,
+        video_id: str,
+        target_updated_at: float,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "workspace": str(workspace),
+            "video_id": video_id,
+            "target_updated_at": float(target_updated_at or 0.0),
+            "outcome": "skipped",
+            "reason": "",
+        }
+
+        try:
+            config = load_b2_config(workspace)
+            if config is None or not getattr(config, "is_valid", lambda: False)():
+                result["reason"] = "cloud settings are incomplete"
+                return result
+            if not getattr(config, "has_identity", lambda: False)():
+                result["reason"] = "cloud user id is missing"
+                return result
+
+            local_project_path = project_path(workspace, video_id)
+            if not local_project_path.exists():
+                result["reason"] = "local project file is missing"
+                return result
+
+            project = load_project(local_project_path)
+            result["title"] = project.title
+            result["channel"] = project.channel
+            project_updated_at = float(getattr(project, "updated_at", 0.0) or 0.0)
+            result["updated_at"] = project_updated_at
+
+            state = load_cloud_state(workspace)
+            last_synced_updated_at = float(
+                state.get(video_id, {}).get("last_synced_updated_at") or 0.0
+            )
+            if project_updated_at <= last_synced_updated_at + 1e-6:
+                result["outcome"] = "unchanged"
+                return result
+
+            store = B2CloudStore(config)
+            lock = store.get_lock(video_id)
+            if not lock:
+                result["outcome"] = "checked_in"
+                return result
+            if not lock_belongs_to(lock, config):
+                result["outcome"] = "lock_lost"
+                result["lock_user"] = str(lock.get("user") or "").strip()
+                result["lock_user_id"] = str(lock.get("user_id") or "").strip()
+                result["lock_role"] = str(lock.get("role") or "").strip()
+                return result
+
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".asr", delete=False) as tf:
+                tmp_path = Path(tf.name)
+            try:
+                packed = pack_asr(workspace, [project], tmp_path)
+                if packed == 0:
+                    result["reason"] = "project could not be packed"
+                    return result
+                store.upload_asr(
+                    video_id,
+                    tmp_path.read_bytes(),
+                    title=project.title,
+                    channel=project.channel,
+                )
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+            store.write_audit_safe(
+                "auto_sync",
+                video_id,
+                details={"updated_at": project_updated_at},
+            )
+            result["outcome"] = "synced"
+            result["lock_user"] = actor_name_for_config(config)
+            result["lock_user_id"] = config.user_id.strip()
+            result["lock_role"] = config.normalized_role()
+            return result
+        except Exception as exc:
+            logger.exception("Cloud auto-sync failed for %s", video_id)
+            result["outcome"] = "error"
+            result["reason"] = str(exc)
+            return result
+
+    def _handle_auto_sync_result(self, result: dict[str, Any]) -> None:
+        workspace = Path(str(result.get("workspace") or self.workspace)).resolve()
+        video_id = str(result.get("video_id") or "").strip()
+        if not video_id:
+            return
+
+        outcome = str(result.get("outcome") or "").strip()
+        current_workspace = workspace == self.workspace
+        title = str(result.get("title") or "").strip() or video_id
+        needs_refresh = False
+
+        if outcome == "synced":
+            update_cloud_state_entry(
+                workspace,
+                video_id,
+                cloud_state="checked_out_self",
+                lock_user=str(result.get("lock_user") or ""),
+                lock_user_id=str(result.get("lock_user_id") or ""),
+                lock_role=str(result.get("lock_role") or ""),
+                title=str(result.get("title") or ""),
+                channel=str(result.get("channel") or ""),
+                last_synced_updated_at=float(result.get("updated_at") or 0.0),
+                uploaded_at=time.time(),
+            )
+            if current_workspace:
+                self._set_status(f"Auto-synced {title} at {time.strftime('%H:%M:%S')}.")
+            return
+
+        if outcome == "lock_lost":
+            update_cloud_state_entry(
+                workspace,
+                video_id,
+                cloud_state="checked_out_other",
+                lock_user=str(result.get("lock_user") or ""),
+                lock_user_id=str(result.get("lock_user_id") or ""),
+                lock_role=str(result.get("lock_role") or ""),
+            )
+            needs_refresh = True
+            if current_workspace:
+                locker = str(result.get("lock_user") or "").strip() or "another user"
+                self._set_status(
+                    f"Cloud lock changed for {title}. It is now read-only locally ({locker})."
+                )
+        elif outcome == "checked_in":
+            update_cloud_state_entry(
+                workspace,
+                video_id,
+                cloud_state="checked_in",
+                lock_user="",
+                lock_user_id="",
+                lock_role="",
+            )
+            needs_refresh = True
+            if current_workspace:
+                self._set_status(
+                    f"{title} is checked in on cloud. The local copy is now read-only."
+                )
+        elif outcome == "error" and current_workspace:
+            self._set_status(f"Auto-sync failed for {title}: {result.get('reason') or 'unknown error'}")
+
+        if needs_refresh and current_workspace:
+            selected_id = self.current_project.video_id if self.current_project else None
+            self.refresh_video_list(select_video_id=selected_id, auto_open=False)
+
     def refresh_video_list(
         self, select_video_id: str | None = None, auto_open: bool = False
     ) -> None:
@@ -1298,14 +2260,24 @@ class ASRReviewApp:
             previous = selected[0] if selected else None
 
         self.video_summaries = discover_videos(self.workspace)
+        self._video_summary_by_id = {
+            item["video_id"]: item for item in self.video_summaries
+        }
         existing_ids = {item["video_id"] for item in self.video_summaries}
 
         for item in self.video_tree.get_children():
             self.video_tree.delete(item)
 
         for summary in self.video_summaries:
-            state = "Reviewed" if summary["source"] == "project" else "Downloaded"
             segment_count = summary["segment_count"]
+            row_tag = ""
+            match summary.get("cloud_state"):
+                case "checked_out_self":
+                    row_tag = "checked_out"
+                case "checked_in":
+                    row_tag = "checked_in"
+                case "checked_out_other":
+                    row_tag = "locked"
             self.video_tree.insert(
                 "",
                 "end",
@@ -1313,10 +2285,15 @@ class ASRReviewApp:
                 text=summary["title"],
                 values=(
                     summary["channel"],
-                    state,
+                    summary.get("state_label", ""),
                     segment_count if segment_count is not None else "-",
                 ),
+                tags=(row_tag,) if row_tag else (),
             )
+
+        if self.current_project:
+            self.current_video_summary = self._video_summary_by_id.get(self.current_project.video_id)
+            self._apply_editor_access_state()
 
         target_id: str | None = None
         if previous and previous in existing_ids:
@@ -1335,12 +2312,15 @@ class ASRReviewApp:
                 self.root.after_idle(lambda: self._open_video_by_id(target_id))
         else:
             self.current_project = None
+            self.current_video_summary = None
+            self.current_read_only = False
             self.current_segment_index = None
             self.video_label_var.set("No video loaded.")
             self.segment_label_var.set("No phrase selected.")
             self._set_text_preview("")
             self._populate_segment_tree()
             self._redraw_waveform()
+            self._apply_editor_access_state()
 
     def _unsuspend_video_select(self) -> None:
         self._suspend_video_select = False
@@ -1351,6 +2331,63 @@ class ASRReviewApp:
         selection = self.video_tree.selection()
         if selection:
             self._open_video_by_id(selection[0])
+
+    def _delete_local_copy(self) -> None:
+        selection = self.video_tree.selection()
+        if not selection:
+            messagebox.showinfo("No Video Selected", "Select a title to delete locally.")
+            return
+
+        video_id = selection[0]
+        summary = self._video_summary_by_id.get(video_id)
+        if not summary:
+            messagebox.showerror("Missing title", f"Could not find local details for {video_id}.")
+            return
+
+        cloud_state = str(summary.get("cloud_state") or "").strip()
+        if cloud_state in {"checked_out_self", "checked_out_other"}:
+            if cloud_state == "checked_out_self":
+                detail = "It is currently checked out by you. Check it in or delete it from cloud first."
+            else:
+                locker = str(summary.get("lock_user") or "").strip() or "someone else"
+                detail = f"It is currently checked out by {locker}."
+            messagebox.showwarning("Cannot delete local copy", detail, parent=self.root)
+            return
+
+        title = str(summary.get("title") or video_id)
+        if cloud_state == "checked_in":
+            prompt = (
+                f"Delete the local copy of '{title}' from this computer?\n\n"
+                "The checked-in cloud copy will remain available."
+            )
+        else:
+            prompt = (
+                f"Delete the local title '{title}' from this computer?\n\n"
+                "This title is not checked in on cloud."
+            )
+        if not messagebox.askyesno("Delete Local Copy", prompt, parent=self.root):
+            return
+
+        fallback_id: str | None = None
+        ids = [item["video_id"] for item in self.video_summaries]
+        if video_id in ids:
+            index = ids.index(video_id)
+            if index + 1 < len(ids):
+                fallback_id = ids[index + 1]
+            elif index > 0:
+                fallback_id = ids[index - 1]
+
+        if self.current_project and self.current_project.video_id == video_id:
+            self._playback_stop_internal()
+            self.current_project = None
+            self.current_video_summary = None
+            self.current_segment_index = None
+            self.current_read_only = False
+
+        removed = delete_local_title_data(self.workspace, video_id)
+        remove_cloud_state_entry(self.workspace, video_id)
+        self.refresh_video_list(select_video_id=fallback_id, auto_open=bool(fallback_id))
+        self._set_status(f"Deleted local copy of {title}. Removed {len(removed)} item(s).")
 
     def _open_video_by_id(self, video_id: str) -> None:
         self._save_current_project()
@@ -1388,13 +2425,10 @@ class ASRReviewApp:
     def _display_project_inner(self, project: VideoProject) -> None:
         logger.debug("_display_project: %s (%d segments)", project.video_id, len(project.segments))
         self.current_project = project
+        self.current_video_summary = self._video_summary_by_id.get(project.video_id, {})
         self.view_span_s = DEFAULT_VIEW_SPAN_S
         self.view_start_s = 0.0
         self.text_dirty = False
-        self.video_label_var.set(
-            f"{project.title}  |  {project.channel or 'Unknown channel'}  |  "
-            f"{len(project.segments)} phrases"
-        )
         logger.debug("_display_project: populating segment tree")
         self._populate_segment_tree()
         if project.segments:
@@ -1405,7 +2439,12 @@ class ASRReviewApp:
             self.segment_label_var.set("No usable phrases were found for this video.")
             self._set_text_preview("")
             self._redraw_waveform()
-        self._set_status(f"Loaded {project.title}")
+        self._apply_editor_access_state()
+        state_label = str((self.current_video_summary or {}).get("state_label") or "").strip()
+        if state_label:
+            self._set_status(f"Loaded {project.title} [{state_label}]")
+        else:
+            self._set_status(f"Loaded {project.title}")
 
     def _segment_row_tag(self, segment: "EditableSegment") -> str:
         """Return the single treeview tag that encodes both enabled and reviewed state."""
@@ -1470,6 +2509,8 @@ class ASRReviewApp:
         if not row or col != "#4":   # #4 = 4th data column = "reviewed"
             return
         if not self.current_project:
+            return
+        if not self._ensure_project_editable("change the reviewed state"):
             return
         index = int(row)
         if index < 0 or index >= len(self.current_project.segments):
@@ -1555,9 +2596,14 @@ class ASRReviewApp:
 
     def _set_text_preview(self, text: str) -> None:
         self._setting_text = True
+        was_disabled = str(self.preview_text.cget("state")) == "disabled"
+        if was_disabled:
+            self.preview_text.config(state="normal")
         self.preview_text.delete("1.0", "end")
         self.preview_text.insert("1.0", text)
         self.preview_text.edit_modified(False)
+        if was_disabled:
+            self.preview_text.config(state="disabled")
         self._setting_text = False
 
     def _normalize_sentence_text(self, text: str) -> str:
@@ -1576,6 +2622,9 @@ class ASRReviewApp:
 
     def _commit_current_segment_text(self) -> bool:
         if not self.current_project or self.current_segment_index is None:
+            return False
+        if self.current_read_only:
+            self.text_dirty = False
             return False
         segment = self.current_project.segments[self.current_segment_index]
         new_text = self._normalize_sentence_text(self.preview_text.get("1.0", "end"))
@@ -1617,6 +2666,8 @@ class ASRReviewApp:
     def _apply_time_entries(self) -> None:
         if not self.current_project or self.current_segment_index is None:
             return
+        if not self._ensure_project_editable("change timings"):
+            return
         self._commit_current_segment_text()
         try:
             start_s = float(self.start_var.get().strip())
@@ -1647,6 +2698,8 @@ class ASRReviewApp:
     def _reset_current_segment(self) -> None:
         if not self.current_project or self.current_segment_index is None:
             return
+        if not self._ensure_project_editable("reset this segment"):
+            return
         self._commit_current_segment_text()
         segment = self.current_project.segments[self.current_segment_index]
         segment.start_s = segment.original_start_s
@@ -1662,6 +2715,8 @@ class ASRReviewApp:
     def _toggle_current_segment_enabled(self) -> None:
         if not self.current_project or self.current_segment_index is None:
             return
+        if not self._ensure_project_editable("change export inclusion"):
+            return
         self._commit_current_segment_text()
         segment = self.current_project.segments[self.current_segment_index]
         segment.enabled = self.enabled_var.get()
@@ -1672,6 +2727,8 @@ class ASRReviewApp:
         """Manual toggle of the Reviewed checkbox."""
         if not self.current_project or self.current_segment_index is None:
             return
+        if not self._ensure_project_editable("change the reviewed state"):
+            return
         segment = self.current_project.segments[self.current_segment_index]
         segment.reviewed = self.reviewed_var.get()
         self._save_current_project()
@@ -1680,6 +2737,8 @@ class ASRReviewApp:
     def _mark_current_reviewed(self) -> None:
         """Auto-mark the current segment as reviewed (called on play / edit)."""
         if not self.current_project or self.current_segment_index is None:
+            return
+        if self.current_read_only:
             return
         segment = self.current_project.segments[self.current_segment_index]
         if segment.reviewed:
@@ -1691,6 +2750,8 @@ class ASRReviewApp:
     def _save_current_project(self, show_feedback: bool = False) -> bool:
         if not self.current_project:
             return False
+        if self.current_read_only:
+            return False
         self._commit_current_segment_text()
         self._persist_project(show_feedback=show_feedback)
         return True
@@ -1698,10 +2759,18 @@ class ASRReviewApp:
     def _persist_project(self, show_feedback: bool = False) -> None:
         if not self.current_project:
             return
+        if self.current_read_only:
+            return
         save_project(
             project_path(self.workspace, self.current_project.video_id),
             self.current_project,
         )
+        if self._current_cloud_state() == "checked_out_self":
+            self._queue_auto_sync(
+                self.workspace,
+                self.current_project.video_id,
+                float(self.current_project.updated_at or 0.0),
+            )
         if show_feedback:
             self._set_status(
                 f"Saved progress for {self.current_project.title} at {time.strftime('%H:%M:%S')}."
@@ -2119,6 +3188,8 @@ class ASRReviewApp:
     def _on_waveform_press(self, event: tk.Event[Any]) -> None:
         if not self.current_project or self.current_segment_index is None:
             return
+        if self.current_read_only:
+            return
         # Shift+click is used for panning, don't start marker drag
         if event.state & 0x0001:  # Shift modifier
             return
@@ -2139,6 +3210,8 @@ class ASRReviewApp:
             or self.drag_target is None
         ):
             return
+        if self.current_read_only:
+            return
 
         segment = self.current_project.segments[self.current_segment_index]
         duration = max(self.current_project.duration, 0.0)
@@ -2158,6 +3231,10 @@ class ASRReviewApp:
 
     def _on_waveform_release(self, _event: tk.Event[Any]) -> None:
         if self.drag_target is not None:
+            if self.current_read_only:
+                self.drag_target = None
+                self._redraw_waveform()
+                return
             self._mark_current_reviewed()
             self._sync_segment_ui()
             self._save_current_project()
@@ -2200,6 +3277,8 @@ class ASRReviewApp:
     def _split_at_cursor(self) -> None:
         """Split the current segment at the text cursor position."""
         if not self.current_project or self.current_segment_index is None:
+            return
+        if not self._ensure_project_editable("split this segment"):
             return
         self._commit_current_segment_text()
         segment = self.current_project.segments[self.current_segment_index]
@@ -2272,6 +3351,8 @@ class ASRReviewApp:
     def _combine_segments(self) -> None:
         """Combine selected adjacent segments into one."""
         if not self.current_project:
+            return
+        if not self._ensure_project_editable("combine these segments"):
             return
         # Use stashed selection — tree selection may be lost when button got focus
         selection = self._last_segment_selection
@@ -2418,6 +3499,40 @@ class ASRReviewApp:
                 self._set_status("Nothing new was downloaded.")
 
         self._run_in_worker("Starting download...", worker, on_done)
+
+    def _import_local_media(self) -> None:
+        dialog = LocalMediaImportDialog(
+            self.root,
+            self.language_var.get() or self.language,
+        )
+        if not dialog.result:
+            return
+        options = dialog.result
+
+        def worker() -> dict[str, Any]:
+            def _status_hook(message: str) -> None:
+                self.worker_queue.put(("status", message))
+
+            project = create_project_from_local_media(
+                self.workspace,
+                Path(options["media_path"]),
+                title=str(options.get("title") or ""),
+                channel=str(options.get("channel") or ""),
+                caption_language=str(options.get("caption_language") or ""),
+                subtitle_mode=str(options.get("subtitle_mode") or "embedded"),
+                subtitle_stream_index=options.get("subtitle_stream_index"),
+                subtitle_file=Path(options["subtitle_file"]) if options.get("subtitle_file") else None,
+                status_hook=_status_hook,
+            )
+            return {"project": project}
+
+        def on_done(result: dict[str, Any]) -> None:
+            project = result["project"]
+            self._display_project(project)
+            self.refresh_video_list(select_video_id=project.video_id, auto_open=False)
+            self._set_status(f"Imported local media as {project.title}")
+
+        self._run_in_worker("Importing local media...", worker, on_done)
 
     def _export_current_project(self) -> None:
         if not self.current_project:
@@ -2588,6 +3703,44 @@ class ASRReviewApp:
             )
 
         self._run_in_worker("Importing .asr…", worker, on_done)
+
+    # ------------------------------------------------------------------
+    # Cloud panel
+    # ------------------------------------------------------------------
+
+    def _open_cloud_panel(self) -> None:
+        if not _HAS_CLOUD:
+            messagebox.showerror(
+                "Missing dependencies",
+                "Cloud features require extra packages.\n\n"
+                "Run:  pip install \".[cloud]\"\n\n"
+                "This installs boto3 (for S3-compatible cloud services)\n"
+                "and cryptography (for encrypted config files).",
+            )
+            return
+
+        # Reuse existing panel window if still open
+        existing = getattr(self, "_cloud_panel", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_set()
+                    return
+            except tk.TclError:
+                pass
+
+        self._cloud_panel = CloudPanel(
+            self.root,
+            workspace        = self.workspace,
+            pack_fn          = pack_asr,
+            unpack_fn        = unpack_asr,
+            list_contents_fn = list_asr_contents,
+            get_project_fn   = lambda vid: ensure_project_for_video(self.workspace, vid),
+            discover_fn      = lambda: discover_videos(self.workspace),
+            prepare_local_fn = lambda: self._save_current_project(),
+            on_cloud_change  = lambda: self.refresh_video_list(auto_open=False),
+        )
 
     # ------------------------------------------------------------------
 
