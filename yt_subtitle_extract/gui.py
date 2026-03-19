@@ -1742,27 +1742,34 @@ class ASRReviewApp:
         # --- Playback controls row ---
         playback_frame = ttk.Frame(editor_frame, padding=(0, 6, 0, 0))
         playback_frame.grid(row=4, column=0, sticky="ew")
+        playback_frame.columnconfigure(0, weight=1)
 
-        self._play_btn = ttk.Button(playback_frame, text="Play", width=6,
+        playback_buttons = ttk.Frame(playback_frame)
+        playback_buttons.grid(row=0, column=0, sticky="w")
+
+        self._play_btn = ttk.Button(playback_buttons, text="Play", width=6,
                                     command=self._playback_play)
         self._play_btn.pack(side="left", padx=(0, 4))
-        self._pause_btn = ttk.Button(playback_frame, text="Pause", width=6,
+        self._pause_btn = ttk.Button(playback_buttons, text="Pause", width=6,
                                      command=self._playback_pause)
         self._pause_btn.pack(side="left", padx=(0, 4))
-        self._stop_btn = ttk.Button(playback_frame, text="Stop", width=6,
+        self._stop_btn = ttk.Button(playback_buttons, text="Stop", width=6,
                                     command=self._playback_stop)
         self._stop_btn.pack(side="left", padx=(0, 10))
         self._loop_var = tk.BooleanVar(value=False)
         self._loop_btn = ttk.Checkbutton(
-            playback_frame,
+            playback_buttons,
             text="Loop",
             variable=self._loop_var,
             command=self._on_loop_toggled,
         )
         self._loop_btn.pack(side="left", padx=(0, 10))
         self._playback_status_var = tk.StringVar(value="")
-        ttk.Label(playback_frame, textvariable=self._playback_status_var,
-                  foreground="#4b5563").pack(side="left")
+        ttk.Label(
+            playback_frame,
+            textvariable=self._playback_status_var,
+            foreground="#4b5563",
+        ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
         if not _HAS_SOUNDDEVICE:
             self._play_btn.state(["disabled"])
@@ -1773,59 +1780,84 @@ class ASRReviewApp:
         # --- Existing controls ---
         controls = ttk.Frame(editor_frame, padding=(0, 10, 0, 0))
         controls.grid(row=5, column=0, sticky="ew")
-        for index in range(12):
-            controls.columnconfigure(index, weight=0)
-        controls.columnconfigure(11, weight=1)
+        controls.columnconfigure(0, weight=1)
+        controls.bind(
+            "<Configure>",
+            lambda event: self._controls_help_label.configure(
+                wraplength=max(int(event.width) - 20, 260)
+            ),
+        )
 
         ttk.Label(controls, textvariable=self.segment_label_var).grid(
-            row=0, column=0, columnspan=12, sticky="w", pady=(0, 8)
+            row=0, column=0, sticky="w", pady=(0, 8)
         )
-        self._previous_btn = ttk.Button(controls, text="Previous", command=self._select_previous_segment)
-        self._previous_btn.grid(row=1, column=0, padx=(0, 6))
-        self._next_btn = ttk.Button(controls, text="Next", command=self._select_next_segment)
-        self._next_btn.grid(row=1, column=1, padx=(0, 12))
-        self._zoom_in_btn = ttk.Button(controls, text="Zoom In", command=lambda: self._zoom(0.7))
-        self._zoom_in_btn.grid(row=1, column=2, padx=(0, 6))
-        self._zoom_out_btn = ttk.Button(controls, text="Zoom Out", command=lambda: self._zoom(1.4))
-        self._zoom_out_btn.grid(row=1, column=3, padx=(0, 12))
-        ttk.Label(controls, text="Start (s)").grid(row=1, column=4, sticky="w")
-        self._start_entry = ttk.Entry(controls, textvariable=self.start_var, width=10)
-        self._start_entry.grid(row=1, column=5, padx=(6, 10))
+
+        navigation_frame = ttk.Frame(controls)
+        navigation_frame.grid(row=1, column=0, sticky="w")
+        self._previous_btn = ttk.Button(navigation_frame, text="Previous", command=self._select_previous_segment)
+        self._previous_btn.pack(side="left", padx=(0, 6))
+        self._next_btn = ttk.Button(navigation_frame, text="Next", command=self._select_next_segment)
+        self._next_btn.pack(side="left", padx=(0, 12))
+        self._zoom_in_btn = ttk.Button(navigation_frame, text="Zoom In", command=lambda: self._zoom(0.7))
+        self._zoom_in_btn.pack(side="left", padx=(0, 6))
+        self._zoom_out_btn = ttk.Button(navigation_frame, text="Zoom Out", command=lambda: self._zoom(1.4))
+        self._zoom_out_btn.pack(side="left")
+
+        timing_frame = ttk.Frame(controls)
+        timing_frame.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(timing_frame, text="Start (s)").pack(side="left")
+        self._start_entry = ttk.Entry(timing_frame, textvariable=self.start_var, width=10)
+        self._start_entry.pack(side="left", padx=(6, 12))
         self._start_entry.bind("<Return>", lambda _event: self._apply_time_entries())
-        ttk.Label(controls, text="End (s)").grid(row=1, column=6, sticky="w")
-        self._end_entry = ttk.Entry(controls, textvariable=self.end_var, width=10)
-        self._end_entry.grid(row=1, column=7, padx=(6, 10))
+        ttk.Label(timing_frame, text="End (s)").pack(side="left")
+        self._end_entry = ttk.Entry(timing_frame, textvariable=self.end_var, width=10)
+        self._end_entry.pack(side="left", padx=(6, 0))
         self._end_entry.bind("<Return>", lambda _event: self._apply_time_entries())
-        self._apply_btn = ttk.Button(controls, text="Apply", command=self._apply_time_entries)
-        self._apply_btn.grid(row=1, column=8, padx=(0, 6))
-        self._reset_btn = ttk.Button(controls, text="Reset Segment", command=self._reset_current_segment)
-        self._reset_btn.grid(row=1, column=9, padx=(0, 10))
+
+        timing_actions = ttk.Frame(controls)
+        timing_actions.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self._apply_btn = ttk.Button(timing_actions, text="Apply", command=self._apply_time_entries)
+        self._apply_btn.pack(side="left", padx=(0, 6))
+        self._reset_btn = ttk.Button(timing_actions, text="Reset Segment", command=self._reset_current_segment)
+        self._reset_btn.pack(side="left")
+
+        flags_frame = ttk.Frame(controls)
+        flags_frame.grid(row=4, column=0, sticky="w", pady=(8, 0))
         self._enabled_check = ttk.Checkbutton(
-            controls,
+            flags_frame,
             text="Include in export",
             variable=self.enabled_var,
             command=self._toggle_current_segment_enabled,
         )
-        self._enabled_check.grid(row=1, column=10, sticky="w", padx=(0, 10))
+        self._enabled_check.pack(side="left", padx=(0, 10))
         self._reviewed_check = ttk.Checkbutton(
-            controls,
+            flags_frame,
             text="Reviewed",
             variable=self.reviewed_var,
             command=self._toggle_current_segment_reviewed,
         )
-        self._reviewed_check.grid(row=1, column=11, sticky="w")
+        self._reviewed_check.pack(side="left")
 
-        self._split_btn = ttk.Button(controls, text="Split at Cursor", command=self._split_at_cursor)
-        self._split_btn.grid(row=2, column=0, columnspan=2, padx=(0, 6), pady=(8, 0), sticky="w")
-        self._combine_btn = ttk.Button(controls, text="Combine Selected", command=self._combine_segments)
-        self._combine_btn.grid(row=2, column=2, columnspan=2, padx=(0, 12), pady=(8, 0), sticky="w")
+        edit_tools_frame = ttk.Frame(controls)
+        edit_tools_frame.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self._split_btn = ttk.Button(edit_tools_frame, text="Split at Cursor", command=self._split_at_cursor)
+        self._split_btn.pack(side="left", padx=(0, 6))
+        self._combine_btn = ttk.Button(edit_tools_frame, text="Combine Selected", command=self._combine_segments)
+        self._combine_btn.pack(side="left")
         help_text = (
             "Drag markers or scroll to pan. "
             "Split: place cursor in text, click Split. "
             "Combine: select adjacent phrases on the right, click Combine."
         )
-        ttk.Label(controls, text=help_text, foreground="#4b5563").grid(
-            row=2, column=4, columnspan=8, sticky="w", pady=(8, 0)
+        self._controls_help_label = ttk.Label(
+            controls,
+            text=help_text,
+            foreground="#4b5563",
+            justify="left",
+            wraplength=700,
+        )
+        self._controls_help_label.grid(
+            row=6, column=0, sticky="ew", pady=(8, 0)
         )
 
         segments_frame.columnconfigure(0, weight=1)
