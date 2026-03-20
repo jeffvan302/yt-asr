@@ -23,4 +23,4 @@ yt-asr = "yt_subtitle_extract.gui:main"
 yt-asr-dataset = "yt_subtitle_extract.dataset:main"
 
 [tool.setuptools.packages.find]
-include = ["yt_subtitle_extract*"]
+include = ["yt_subtitle_extract*", "yt_asr*", "yt_asr_dataset*"]

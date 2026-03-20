@@ -6,20 +6,67 @@ Download YouTube audio + auto-captions, review timing in a GUI editor, and expor
 
 ```bash
 # Basic install (GUI works but without audio playback or cloud sync)
-pip install .
+python -m pip install .
 
 # With audio playback support
-pip install ".[audio]"
+python -m pip install ".[audio]"
 
 # With S3-compatible cloud collaboration
-pip install ".[cloud]"
+python -m pip install ".[cloud]"
 
 # Everything
-pip install ".[all]"
+python -m pip install ".[all]"
 
 # Development / editable install
-pip install -e ".[all]"
+python -m pip install -e ".[all]"
 ```
+
+### Windows note if `yt-asr` is not on PATH
+
+If `pip` says the launchers were installed into a folder like:
+
+```text
+C:\Users\<you>\AppData\Roaming\Python\Python312\Scripts
+```
+
+then the install succeeded, but that Scripts folder is not on `PATH`.
+
+You can:
+
+1. add that Scripts folder to `PATH`
+2. install inside an activated virtual environment
+3. launch the package directly with Python
+
+```bash
+# GUI
+py -m yt_asr
+
+# Dataset CLI
+py -m yt_asr_dataset "https://www.youtube.com/watch?v=VIDEO_ID" --output ./dataset --language af
+```
+
+### Recommended Windows setup with Miniconda
+
+If you are installing from a shared zip on Windows, this is the smoothest setup:
+
+1. Extract the zip to a normal writable folder.
+2. Install Miniconda first if you do not already have it.
+3. Create and activate a dedicated environment.
+4. Run the prerequisite installer from the `install/` folder.
+5. Return to the project root and install the app there.
+
+Example:
+
+```powershell
+conda create -n yt-asr python=3.13
+conda activate yt-asr
+cd install
+.\win-required.bat
+cd ..
+python -m pip install .[all]
+```
+
+After that, go to the folder where you want to keep your subtitle work and start the app from the same environment.
 
 ### System dependencies
 
@@ -76,6 +123,9 @@ yt-asr --workspace ./my_project
 
 # Set default caption language
 yt-asr --language en
+
+# Windows fallback if yt-asr is not on PATH
+py -m yt_asr --workspace ./my_project --language en
 ```
 
 ### CLI dataset builder — `yt-asr-dataset`
@@ -89,7 +139,23 @@ yt-asr-dataset "https://www.youtube.com/watch?v=VIDEO_ID" --output ./dataset --l
 
 # Multiple URLs
 yt-asr-dataset URL1 URL2 URL3 --output ./dataset
+
+# Windows fallback if yt-asr-dataset is not on PATH
+py -m yt_asr_dataset URL1 URL2 URL3 --output ./dataset
 ```
+
+### Typical GUI workflow
+
+1. Open the app in the workspace where you want to store your title data.
+2. Add a new YouTube video by pasting the link and clicking **Download**, or use **Import Media...** for local files.
+3. Select a title from the list on the left to load it into the editor.
+4. Edit caption text in the text box, and adjust timing by dragging the red start marker and green end marker on the waveform.
+5. Use the playback controls to listen to the current phrase. Enable **Loop** when you want repeated playback.
+6. Pan around the waveform with the mouse wheel, Shift+drag, or middle-mouse drag.
+7. To split a phrase, place the text cursor where you want the split and click **Split at Cursor**.
+8. To merge phrases, select adjacent items in the phrase list and click **Combine Selected**.
+9. Save regularly with **Save Progress**.
+10. If you are working with a team, use the **Cloud** window to upload new titles or check titles in and out.
 
 ## Features
 

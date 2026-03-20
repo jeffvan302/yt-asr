@@ -82,6 +82,13 @@ yt-asr-dataset "https://www.youtube.com/watch?v=VIDEO_ID" --output ./dataset --l
 yt-asr-dataset URL1 URL2 URL3 --output ./dataset
 ```
 
+If the generated `yt-asr.exe` / `yt-asr-dataset.exe` launchers are installed into a per-user Scripts directory that is not on `PATH`, the package can still be started directly with Python:
+
+```bash
+py -m yt_asr --workspace ./my_project --language en
+py -m yt_asr_dataset URL1 URL2 URL3 --output ./dataset
+```
+
 ---
 
 ## Workspace Layout
