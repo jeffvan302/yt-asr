@@ -2,6 +2,10 @@
 
 Download YouTube audio + auto-captions, review timing in a GUI editor, and export ASR training datasets.
 
+## If you are not familiar with Python Environments then follow this guide:
+1) Install Guide [documentation/How_to_Install.pdf](documentation/How_to_Install.pdf).
+2) Application Quick Usage Guide [documentation/How_to_Use_the_App.pdf](documentation/How_to_Use_the_App.pdf)
+
 ## Install
 
 ```bash
