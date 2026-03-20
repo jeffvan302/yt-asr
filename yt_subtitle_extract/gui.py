@@ -108,6 +108,11 @@ REVIEW_MERGE_GAP = 0.35
 REVIEW_MIN_DURATION_S = 0.35
 REVIEW_MAX_DURATION_S = 20.0
 REVIEW_MIN_CHARS = 2
+DEFAULT_MANUAL_SEGMENT_TEXT = "<Sentence>"
+DEFAULT_MANUAL_SEGMENT_LEN_S = 2.0
+DEFAULT_PLAYBACK_SPEED = 1.0
+MIN_PLAYBACK_SPEED = 0.5
+MAX_PLAYBACK_SPEED = 1.5
 MARKER_HITBOX_PX = 10
 AUTO_SYNC_IDLE_TIMEOUT_S = 0.35
 IMAGE_SUBTITLE_CODECS = {
@@ -203,6 +208,35 @@ def metadata_path(root: Path, video_id: str) -> Path:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_empty_caption_file(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"events": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def clamp_playback_speed(speed: Any) -> float:
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        value = DEFAULT_PLAYBACK_SPEED
+    return max(MIN_PLAYBACK_SPEED, min(MAX_PLAYBACK_SPEED, round(value, 2)))
+
+
+def playback_speed_text(speed: Any) -> str:
+    return f"{clamp_playback_speed(speed):.2f}x"
+
+
+def playback_status_text(state: str, speed: Any, *, loop: bool = False) -> str:
+    text = f"{state} @ {playback_speed_text(speed)}"
+    if loop:
+        text += " [Loop]"
+    return text
+
+
+def effective_playback_samplerate(rate: int, speed: Any) -> int:
+    return max(1, int(round(rate * clamp_playback_speed(speed))))
 
 
 def _to_relative(p: Path, root: Path) -> Path:
@@ -741,6 +775,48 @@ def build_segments_from_caption(caption_path: Path) -> list[EditableSegment]:
     ]
 
 
+def build_manual_segment(
+    project: VideoProject,
+    *,
+    after_index: int | None = None,
+    text: str = DEFAULT_MANUAL_SEGMENT_TEXT,
+) -> EditableSegment:
+    duration = max(float(project.duration or 0.0), 0.0)
+    span = DEFAULT_MANUAL_SEGMENT_LEN_S
+    if duration > 0:
+        span = min(span, duration)
+    span = max(MIN_SEGMENT_LEN_S, span)
+
+    start_s = 0.0
+    if project.segments:
+        if after_index is None or after_index < 0 or after_index >= len(project.segments):
+            anchor = project.segments[-1]
+        else:
+            anchor = project.segments[after_index]
+        start_s = max(0.0, float(anchor.end_s))
+
+    if duration > 0:
+        max_start = max(0.0, duration - span)
+        start_s = min(start_s, max_start)
+        end_s = min(duration, start_s + span)
+        if end_s - start_s < MIN_SEGMENT_LEN_S:
+            start_s = max(0.0, duration - MIN_SEGMENT_LEN_S)
+            end_s = duration
+    else:
+        end_s = start_s + span
+
+    return EditableSegment(
+        index=0,
+        text=text,
+        start_s=round(start_s, 3),
+        end_s=round(end_s, 3),
+        original_start_s=round(start_s, 3),
+        original_end_s=round(end_s, 3),
+        enabled=True,
+        reviewed=False,
+    )
+
+
 def metadata_to_project(root: Path, payload: dict[str, Any]) -> VideoProject:
     video_id = payload.get("id") or payload.get("video_id")
     if not video_id:
@@ -825,12 +901,37 @@ def create_project_from_url(
     _status("Downloading audio...")
     audio_file = download_audio(url, video_id, dirs["downloads"], None, progress_hook=progress_hook)
     _status("Fetching captions...")
-    caption_language, caption_entry = select_caption_track(info, language)
-    caption_ext = (caption_entry.get("ext") or "json3").lower()
+    caption_language = language or "und"
+    caption_ext = "json3"
     caption_file = dirs["captions"] / (
         f"{sanitize_filename(video_id)}.{caption_language}.{caption_ext}"
     )
-    fetch_caption_file(caption_entry["url"], caption_file)
+    try:
+        caption_language, caption_entry = select_caption_track(info, language)
+        caption_ext = (caption_entry.get("ext") or "json3").lower()
+        caption_file = dirs["captions"] / (
+            f"{sanitize_filename(video_id)}.{caption_language}.{caption_ext}"
+        )
+        fetch_caption_file(
+            caption_entry["url"],
+            caption_file,
+            video_url=url,
+            caption_language=caption_language,
+            caption_format=caption_ext,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not fetch captions for %s. Creating empty project for manual sentences: %s",
+            video_id,
+            exc,
+        )
+        caption_ext = "json3"
+        caption_file = dirs["captions"] / (
+            f"{sanitize_filename(video_id)}.{caption_language}.{caption_ext}"
+        )
+        caption_file.unlink(missing_ok=True)
+        write_empty_caption_file(caption_file)
+        _status("No usable captions were available. Creating an empty project for manual sentence entry...")
 
     metadata = {
         "id": video_id,
@@ -1524,6 +1625,10 @@ class ASRReviewApp:
         self.segment_label_var = tk.StringVar(value="No phrase selected.")
         self.start_var = tk.StringVar()
         self.end_var = tk.StringVar()
+        self._playback_speed_var = tk.DoubleVar(value=DEFAULT_PLAYBACK_SPEED)
+        self._playback_speed_label_var = tk.StringVar(
+            value=playback_speed_text(DEFAULT_PLAYBACK_SPEED)
+        )
         self.enabled_var  = tk.BooleanVar(value=True)
         self.reviewed_var = tk.BooleanVar(value=False)
 
@@ -1764,17 +1869,39 @@ class ASRReviewApp:
             command=self._on_loop_toggled,
         )
         self._loop_btn.pack(side="left", padx=(0, 10))
+        playback_speed_frame = ttk.Frame(playback_frame)
+        playback_speed_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(playback_speed_frame, text="Speed").pack(side="left", padx=(0, 8))
+        self._playback_speed_scale = ttk.Scale(
+            playback_speed_frame,
+            from_=MIN_PLAYBACK_SPEED,
+            to=MAX_PLAYBACK_SPEED,
+            variable=self._playback_speed_var,
+            orient="horizontal",
+            length=180,
+            command=self._on_playback_speed_drag,
+        )
+        self._playback_speed_scale.pack(side="left", fill="x")
+        self._playback_speed_scale.bind("<ButtonRelease-1>", self._on_playback_speed_commit)
+        self._playback_speed_scale.bind("<KeyRelease>", self._on_playback_speed_commit)
+        ttk.Label(
+            playback_speed_frame,
+            textvariable=self._playback_speed_label_var,
+            width=6,
+            anchor="e",
+        ).pack(side="left", padx=(8, 0))
         self._playback_status_var = tk.StringVar(value="")
         ttk.Label(
             playback_frame,
             textvariable=self._playback_status_var,
             foreground="#4b5563",
-        ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ).grid(row=2, column=0, sticky="ew", pady=(4, 0))
 
         if not _HAS_SOUNDDEVICE:
             self._play_btn.state(["disabled"])
             self._pause_btn.state(["disabled"])
             self._stop_btn.state(["disabled"])
+            self._playback_speed_scale.state(["disabled"])
             self._playback_status_var.set("pip install sounddevice to enable playback")
 
         # --- Existing controls ---
@@ -1840,11 +1967,14 @@ class ASRReviewApp:
 
         edit_tools_frame = ttk.Frame(controls)
         edit_tools_frame.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self._add_sentence_btn = ttk.Button(edit_tools_frame, text="Add Sentence", command=self._add_sentence)
+        self._add_sentence_btn.pack(side="left", padx=(0, 6))
         self._split_btn = ttk.Button(edit_tools_frame, text="Split at Cursor", command=self._split_at_cursor)
         self._split_btn.pack(side="left", padx=(0, 6))
         self._combine_btn = ttk.Button(edit_tools_frame, text="Combine Selected", command=self._combine_segments)
         self._combine_btn.pack(side="left")
         help_text = (
+            "Add Sentence creates a new editable phrase. "
             "Drag markers or scroll to pan. "
             "Split: place cursor in text, click Split. "
             "Combine: select adjacent phrases on the right, click Combine."
@@ -1965,6 +2095,7 @@ class ASRReviewApp:
         self._reset_btn.state(button_state)
         self._enabled_check.state(check_state)
         self._reviewed_check.state(check_state)
+        self._add_sentence_btn.state(button_state)
         self._split_btn.state(button_state)
         self._combine_btn.state(button_state)
         if hasattr(self, "_save_progress_btn"):
@@ -2468,7 +2599,11 @@ class ASRReviewApp:
             self._select_segment_by_index(0)
         else:
             self.current_segment_index = None
-            self.segment_label_var.set("No usable phrases were found for this video.")
+            self.segment_label_var.set("No phrases yet. Click Add Sentence to create one.")
+            self.start_var.set("")
+            self.end_var.set("")
+            self.enabled_var.set(True)
+            self.reviewed_var.set(False)
             self._set_text_preview("")
             self._redraw_waveform()
         self._apply_editor_access_state()
@@ -2823,12 +2958,31 @@ class ASRReviewApp:
                     "✓" if segment.enabled  else "✗",
                     "✓" if segment.reviewed else "☐",
                 ),
-                tags=(self._segment_row_tag(segment),),
-            )
-        self.segment_label_var.set(
-            f"Phrase {self.current_segment_index + 1}/{len(self.current_project.segments)}  |  "
-            f"{segment.end_s - segment.start_s:.2f}s"
+            tags=(self._segment_row_tag(segment),),
         )
+
+    def _add_sentence(self) -> None:
+        if not self.current_project:
+            self._set_status("Load a title first.")
+            return
+        if not self._ensure_project_editable("add a sentence"):
+            return
+
+        insert_after = self.current_segment_index
+        insert_at = len(self.current_project.segments)
+        if insert_after is not None and 0 <= insert_after < len(self.current_project.segments):
+            insert_at = insert_after + 1
+
+        segment = build_manual_segment(
+            self.current_project,
+            after_index=insert_after,
+        )
+        self.current_project.segments.insert(insert_at, segment)
+        self._reindex_segments()
+        self._persist_project()
+        self._populate_segment_tree()
+        self._select_segment_by_index(insert_at)
+        self._set_status("Added a new sentence. Edit the text and adjust the timing as needed.")
 
     def _visible_range(self) -> tuple[float, float]:
         if not self.current_project:
@@ -3012,6 +3166,31 @@ class ASRReviewApp:
 
     # ---- Audio playback ----
 
+    def _current_playback_speed(self) -> float:
+        speed = clamp_playback_speed(self._playback_speed_var.get())
+        self._playback_speed_label_var.set(playback_speed_text(speed))
+        return speed
+
+    def _on_playback_speed_drag(self, _value: str) -> None:
+        self._current_playback_speed()
+
+    def _on_playback_speed_commit(self, _event: tk.Event[Any]) -> None:
+        raw_speed = float(self._playback_speed_var.get())
+        speed = self._current_playback_speed()
+        if abs(raw_speed - speed) > 1e-6:
+            self._playback_speed_var.set(speed)
+        if self._playback_stream is None:
+            return
+        was_paused = self._playback_paused
+        self._playback_stop_internal()
+        if was_paused:
+            self._playback_status_var.set(
+                playback_status_text("Ready", speed, loop=self._loop_var.get())
+            )
+            self._redraw_waveform()
+            return
+        self._playback_play()
+
     def _current_playback_time_s(self) -> float | None:
         if self._playback_stream is None:
             return None
@@ -3089,10 +3268,13 @@ class ASRReviewApp:
     def _playback_play(self) -> None:
         if not _HAS_SOUNDDEVICE:
             return
+        speed = self._current_playback_speed()
         # If paused, resume
         if self._playback_paused and self._playback_stream is not None:
             self._playback_paused = False
-            self._playback_status_var.set("Playing...")
+            self._playback_status_var.set(
+                playback_status_text("Playing...", speed, loop=self._playback_loop)
+            )
             self._schedule_playback_indicator()
             return
         # Stop any existing playback
@@ -3115,7 +3297,9 @@ class ASRReviewApp:
         self._playback_sampwidth = sampwidth
         self._playback_segment_start_s = segment.start_s
         self._playback_segment_end_s = segment.end_s
-        self._playback_status_var.set("Playing..." + (" [Loop]" if self._playback_loop else ""))
+        self._playback_status_var.set(
+            playback_status_text("Playing...", speed, loop=self._playback_loop)
+        )
 
         bytes_per_frame = channels * sampwidth
 
@@ -3144,7 +3328,7 @@ class ASRReviewApp:
         try:
             dtype = "int16" if sampwidth == 2 else "int8" if sampwidth == 1 else "int16"
             self._playback_stream = sd.RawOutputStream(
-                samplerate=rate,
+                samplerate=effective_playback_samplerate(rate, speed),
                 channels=channels,
                 dtype=dtype,
                 blocksize=1024,
@@ -3160,10 +3344,12 @@ class ASRReviewApp:
     def _playback_pause(self) -> None:
         if self._playback_stream is None:
             return
+        speed = self._current_playback_speed()
         self._playback_paused = not self._playback_paused
         self._playback_status_var.set(
-            "Paused" if self._playback_paused
-            else "Playing..." + (" [Loop]" if self._playback_loop else "")
+            playback_status_text("Paused", speed, loop=self._playback_loop)
+            if self._playback_paused
+            else playback_status_text("Playing...", speed, loop=self._playback_loop)
         )
         if self._playback_paused:
             self._draw_playback_indicator()
@@ -3190,14 +3376,20 @@ class ASRReviewApp:
     def _playback_finished(self) -> None:
         """Called from audio callback when non-looping playback ends."""
         self._playback_stop_internal()
-        self._playback_status_var.set("Finished")
+        self._playback_status_var.set(
+            playback_status_text("Finished", self._current_playback_speed())
+        )
         self._redraw_waveform()
 
     def _on_loop_toggled(self) -> None:
         self._playback_loop = self._loop_var.get()
         if self._playback_stream is not None and not self._playback_paused:
             self._playback_status_var.set(
-                "Playing..." + (" [Loop]" if self._playback_loop else "")
+                playback_status_text(
+                    "Playing...",
+                    self._current_playback_speed(),
+                    loop=self._playback_loop,
+                )
             )
 
     def _refresh_playback_data(self) -> None:

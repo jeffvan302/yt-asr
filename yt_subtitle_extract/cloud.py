@@ -391,6 +391,30 @@ def refresh_cloud_state_from_listing(
     return refreshed
 
 
+def filter_uploadable_summaries(
+    local_summaries: list[dict[str, Any]],
+    cloud_titles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    cloud_ids = {
+        str(item.get("video_id") or "").strip()
+        for item in cloud_titles
+        if str(item.get("video_id") or "").strip()
+    }
+    blocked_states = {"checked_in", "checked_out_self", "checked_out_other"}
+    filtered: list[dict[str, Any]] = []
+    for summary in local_summaries:
+        video_id = str(summary.get("video_id") or "").strip()
+        if not video_id:
+            continue
+        if video_id in cloud_ids:
+            continue
+        cloud_state = str(summary.get("cloud_state") or "").strip()
+        if cloud_state in blocked_states:
+            continue
+        filtered.append(summary)
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Encrypted config export / import (.b2cfg files)
 # ---------------------------------------------------------------------------
@@ -1917,16 +1941,31 @@ class CloudPanel(tk.Toplevel):
     # ------------------------------------------------------------------ upload new
 
     def _upload_new(self) -> None:
-        """Upload a title from the local workspace that is not on cloud yet."""
+        """Upload local-only titles that do not already exist on cloud."""
+        if not self._require_identity():
+            return
+        self._prepare_local()
         local = self._discover()
         if not local:
             messagebox.showinfo("No local titles", "No titles found in the current workspace.", parent=self)
             return
-        if not self._require_identity():
+        store = self._get_store()
+        if not store:
+            return
+        uploadable = filter_uploadable_summaries(local, store.list_titles())
+        if not uploadable:
+            messagebox.showinfo(
+                "Nothing to upload",
+                (
+                    "Upload from Workspace only lists titles that are local-only and not yet on cloud.\n\n"
+                    "Use Check Out / Check In for titles that already exist on both the computer and server."
+                ),
+                parent=self,
+            )
             return
 
         from yt_subtitle_extract.gui import TitleSelectDialog  # local import to avoid circular
-        dlg = TitleSelectDialog(self, "Select titles to upload", local, default_all=False)
+        dlg = TitleSelectDialog(self, "Select local-only titles to upload", uploadable, default_all=False)
         selected_ids = dlg.result
         if not selected_ids:
             return
@@ -1942,11 +1981,6 @@ class CloudPanel(tk.Toplevel):
             return
         check_in_after_upload = bool(upload_choice)
 
-        self._prepare_local()
-        store = self._get_store()
-        if not store:
-            return
-
         selected_set = set(selected_ids)
         self._set_status(f"Uploading {len(selected_ids)} title(s)…")
 
@@ -1959,7 +1993,7 @@ class CloudPanel(tk.Toplevel):
                 for item in store.list_titles()
             }
             import tempfile
-            for summary in local:
+            for summary in uploadable:
                 vid = summary["video_id"]
                 if vid not in selected_set:
                     continue

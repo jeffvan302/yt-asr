@@ -11,6 +11,7 @@ from yt_subtitle_extract.cloud import (
     B2Config,
     _HAS_CRYPTO,
     export_b2_config,
+    filter_uploadable_summaries,
     import_b2_config,
     load_b2_config,
     lock_belongs_to,
@@ -268,6 +269,25 @@ class CloudIdentityTests(unittest.TestCase):
         self.assertFalse(imported.uses_managed_user_config())
         self.assertEqual(imported.normalized_role(), "admin")
         self.assertEqual(imported.role, "admin")
+
+
+class UploadCandidateFilterTests(unittest.TestCase):
+    def test_filter_uploadable_summaries_keeps_only_local_only_titles(self):
+        local = [
+            {"video_id": "local-only", "title": "Local Only", "cloud_state": ""},
+            {"video_id": "checked-in", "title": "Checked In", "cloud_state": "checked_in"},
+            {"video_id": "checked-out", "title": "Checked Out", "cloud_state": "checked_out_self"},
+            {"video_id": "remote-present", "title": "Remote Present", "cloud_state": ""},
+        ]
+        cloud = [
+            {"video_id": "checked-in", "title": "Checked In"},
+            {"video_id": "checked-out", "title": "Checked Out"},
+            {"video_id": "remote-present", "title": "Remote Present"},
+        ]
+
+        filtered = filter_uploadable_summaries(local, cloud)
+
+        self.assertEqual([item["video_id"] for item in filtered], ["local-only"])
 
 
 if __name__ == "__main__":

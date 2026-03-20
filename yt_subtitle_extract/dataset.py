@@ -34,6 +34,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +59,7 @@ MUSIC_ONLY_RE = re.compile(
 BRACKET_STAGE_RE = re.compile(r"^\s*[\[(].*?[\])]\s*$")
 WHITESPACE_RE = re.compile(r"\s+")
 TEXT_SUFFIXES = {".json", ".json3", ".srv3", ".ttml", ".vtt", ".srt", ".ass", ".ssa", ".xml"}
+RETRYABLE_CAPTION_HTTP_CODES = {403, 429, 500, 502, 503, 504}
 
 
 @dataclass
@@ -322,14 +325,104 @@ def select_caption_track(info: dict[str, Any], language: str) -> tuple[str, dict
     return lang_key, entry
 
 
-def fetch_caption_file(url: str, dest: Path) -> Path:
+def _download_caption_file_with_yt_dlp(
+    video_url: str,
+    dest: Path,
+    *,
+    caption_language: str,
+    caption_format: str,
+    cookies: str | None = None,
+) -> Path:
+    yt_dlp = load_yt_dlp()
+    caption_format = (caption_format or dest.suffix.lstrip(".") or "json3").lower()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "no_color": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+            "skip_download": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [caption_language],
+            "subtitlesformat": caption_format,
+            "outtmpl": str(tmp_root / "%(id)s.%(ext)s"),
+        }
+        if cookies:
+            opts["cookiefile"] = cookies
+
+        with _suppress_windows_console(), yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([video_url])
+
+        candidates = sorted(tmp_root.rglob(f"*.{caption_format}"))
+        preferred = [
+            path for path in candidates
+            if f".{caption_language}." in path.name or path.stem.endswith(f".{caption_language}")
+        ]
+        if preferred:
+            candidates = preferred
+        if not candidates:
+            raise RuntimeError(
+                f"yt-dlp did not produce a subtitle file for language '{caption_language}' in format '{caption_format}'."
+            )
+
+        dest.write_bytes(candidates[0].read_bytes())
+    return dest
+
+
+def fetch_caption_file(
+    url: str,
+    dest: Path,
+    *,
+    video_url: str | None = None,
+    caption_language: str = "",
+    caption_format: str = "",
+    cookies: str | None = None,
+) -> Path:
     if dest.exists():
         return dest
 
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        dest.write_bytes(response.read())
-    return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.youtube.com",
+            "Referer": video_url or "https://www.youtube.com/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            dest.write_bytes(response.read())
+        return dest
+    except urllib.error.HTTPError as exc:
+        if (
+            exc.code in RETRYABLE_CAPTION_HTTP_CODES
+            and video_url
+            and caption_language
+        ):
+            try:
+                return _download_caption_file_with_yt_dlp(
+                    video_url,
+                    dest,
+                    caption_language=caption_language,
+                    caption_format=caption_format,
+                    cookies=cookies,
+                )
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Caption download failed with HTTP {exc.code} and the yt-dlp fallback also failed: {fallback_exc}"
+                ) from fallback_exc
+        if exc.code == 429:
+            raise RuntimeError(
+                "YouTube rate-limited the caption download (HTTP 429). Wait a bit and try again."
+            ) from exc
+        raise
 
 
 def normalize_text(text: str) -> str:
@@ -652,7 +745,14 @@ def process_url(url: str, args: argparse.Namespace, dirs: dict[str, Path]) -> li
     caption_lang, caption_entry = select_caption_track(info, args.language)
     caption_ext = (caption_entry.get("ext") or "json3").lower()
     caption_path = dirs["captions"] / f"{video_slug}.{caption_lang}.{caption_ext}"
-    fetch_caption_file(caption_entry["url"], caption_path)
+    fetch_caption_file(
+        caption_entry["url"],
+        caption_path,
+        video_url=url,
+        caption_language=caption_lang,
+        caption_format=caption_ext,
+        cookies=args.cookies,
+    )
 
     raw_segments = load_segments(caption_path)
     segments = collapse_segments(

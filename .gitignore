@@ -18,6 +18,8 @@ venv/
 env/
 ENV/
 .env
+runtime/
+workdata/
 
 # Distribution / packaging
 *.tar.gz

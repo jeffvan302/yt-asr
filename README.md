@@ -3,6 +3,16 @@
 Download YouTube audio + auto-captions, review timing in a GUI editor, and export ASR training datasets.
 
 ## If you are not familiar with Python Environments then follow this guide:
+
+### Option A
+1) Run the yt-asr-launcher.exe
+*** Option A ***
+This launcher will install a local runtime of python with required libraries.
+Then create a workdata folder and run the yt-asr app in the workdata folder using the local runtime of python.
+Subsequent launches will make sure the runtime environment is in place and then launch the yt-asr app.
+You can follow the instructions on how to use the app here at [documentation/How_to_Use_the_App.pdf](documentation/How_to_Use_the_App.pdf).
+
+### Option B
 1) Install Guide [documentation/How_to_Install.pdf](documentation/How_to_Install.pdf).
 2) Application Quick Usage Guide [documentation/How_to_Use_the_App.pdf](documentation/How_to_Use_the_App.pdf)
 
@@ -158,8 +168,9 @@ py -m yt_asr_dataset URL1 URL2 URL3 --output ./dataset
 6. Pan around the waveform with the mouse wheel, Shift+drag, or middle-mouse drag.
 7. To split a phrase, place the text cursor where you want the split and click **Split at Cursor**.
 8. To merge phrases, select adjacent items in the phrase list and click **Combine Selected**.
-9. Save regularly with **Save Progress**.
-10. If you are working with a team, use the **Cloud** window to upload new titles or check titles in and out.
+9. If a video has no usable subtitles, the title still opens in the editor. Click **Add Sentence** to create a new phrase with the default text `<Sentence>`, then edit the text and timing manually.
+10. Save regularly with **Save Progress**.
+11. If you are working with a team, use the **Cloud** window to upload new titles or check titles in and out.
 
 ## Features
 
@@ -169,9 +180,11 @@ py -m yt_asr_dataset URL1 URL2 URL3 --output ./dataset
 - Interactive waveform view with draggable start/end markers
 - **Waveform panning** — Scroll wheel or Shift+drag to pan left/right
 - **Audio playback** — Play, Pause, Stop with loop mode for fine-tuning timing
+- **Playback speed slider** — Slow down or speed up phrase playback while reviewing timing
 - **Live playback update** — Dragging markers automatically updates playback boundaries
 - **Split at Cursor** — Place cursor in caption text and split a phrase into two
 - **Combine Selected** — Ctrl+click adjacent phrases and merge them (time ranges + text)
+- **Add Sentence** — Create a new editable caption phrase with default text when you need to transcribe manually
 - Enable/disable individual phrases for export
 - Export reviewed clips and a training TSV manifest
 
