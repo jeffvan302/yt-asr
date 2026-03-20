@@ -47,6 +47,36 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
+### One-step batch build
+
+On another Windows machine, you can also run:
+
+```bat
+win-launcher\build-launcher.bat
+```
+
+The batch file will:
+
+- find a Visual Studio C++ toolchain
+- load the compiler environment
+- find CMake
+- configure and build the launcher
+- print the official Microsoft download page if the required compiler tools are missing
+
+If Visual Studio is not installed yet, install either Visual Studio Community or Visual Studio Build Tools from Microsoft's official pages:
+
+- Build Tools for Visual Studio: [visualstudio.microsoft.com/downloads](https://visualstudio.microsoft.com/downloads/)
+- Visual C++ tools overview: [visualstudio.microsoft.com/vs/cplusplus](https://visualstudio.microsoft.com/vs/cplusplus/)
+
+On the downloads page, use the `Build Tools for Visual Studio` download under `Tools for Visual Studio`.
+
+Install it with:
+
+- `Desktop development with C++`
+- `MSVC v143 or newer C++ x64/x86 build tools`
+- `Windows 11 SDK` or `Windows 10 SDK`
+- `C++ CMake tools for Windows`
+
 The resulting executable will be named:
 
 ```text

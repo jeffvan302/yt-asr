@@ -6,7 +6,8 @@ Download YouTube audio + auto-captions, review timing in a GUI editor, and expor
 
 ### Option A
 1) Run the yt-asr-launcher.exe
-*** Option A ***
+
+
 This launcher will install a local runtime of python with required libraries.
 Then create a workdata folder and run the yt-asr app in the workdata folder using the local runtime of python.
 Subsequent launches will make sure the runtime environment is in place and then launch the yt-asr app.
